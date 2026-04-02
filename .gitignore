@@ -1,7 +1,9 @@
 node_modules
 dist
+.pnpm-store
 .env
 .env.*
 .data
 coverage
 .DS_Store
+pnpm-debug.log*
