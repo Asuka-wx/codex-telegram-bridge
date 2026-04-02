@@ -1,6 +1,12 @@
 import { SessionIndex } from "../codex/session-index.js";
+import { ApprovalCoordinator } from "../approval/approval-coordinator.js";
 import { TelegramBotService } from "../telegram/bot.js";
-import { hasVisibleApprovalPrompt, TmuxService } from "../tmux/service.js";
+import {
+  hasStructuredApprovalWaiting,
+  hasTmuxFallbackApproval,
+} from "../approval/linked-approval.js";
+import { buildLinkedApprovalPlan } from "../approval/linked-approval-plan.js";
+import { TmuxService } from "../tmux/service.js";
 import type {
   ApprovalActionKey,
   ApprovalRequest,
@@ -18,7 +24,11 @@ export class BridgeService {
 
   readonly stateStore = new StateStore();
 
-  readonly telegram = new TelegramBotService(this);
+  readonly approvals = new ApprovalCoordinator((sessionId) =>
+    this.getSessionFresh(sessionId),
+  );
+
+  readonly telegram = new TelegramBotService(this, this.approvals);
 
   private readonly topicPanelSignatures = new Map<string, string>();
 
@@ -44,9 +54,7 @@ export class BridgeService {
     });
 
     this.sessionIndex.on("sessionMessage", (message) => {
-      const sessions = this.getTelegramManagedSessions(
-        this.tmux.refreshSessionFacts(message.sessionId),
-      );
+      const sessions = this.tmux.refreshSessionFacts(message.sessionId);
       const targets = sessions.filter(
         (session) => session.linkedSessionId === message.sessionId,
       );
@@ -249,30 +257,17 @@ export class BridgeService {
       this.telegram.clearApprovalTracking(session.id);
     }
     if (session.linkedSessionId) {
-      const sessions = this.getTelegramManagedSessions(
-        this.tmux.refreshSessionFacts(session.linkedSessionId),
-      );
-      const linkedTargets = sessions.filter(
-        (candidate) => candidate.linkedSessionId === session.linkedSessionId,
-      );
-      const linkedStillWaiting = linkedTargets.some(
-        (candidate) => candidate.runtimeState === "waitingApproval",
-      );
+      const { sessions, linkedTargets, structuredSession } =
+        this.getLinkedTargetContext(session.linkedSessionId);
+      const linkedStillWaiting =
+        linkedTargets.some((candidate) => candidate.runtimeState === "waitingApproval") ||
+        hasStructuredApprovalWaiting(structuredSession);
       if (linkedStillWaiting) {
-        const delivered = await this.syncActiveApprovalsToTelegram(
-          linkedTargets,
+        await this.syncLinkedApprovalsWithResync(
           session.linkedSessionId,
+          linkedTargets,
+          "paneChanged",
         );
-        if (!delivered) {
-          logger.info("app", "linked 审批首拍未送达，等待重试", {
-            source: "paneChanged",
-            linkedSessionId: session.linkedSessionId,
-            targetSessionIds: linkedTargets.map((target) => target.id),
-          });
-          this.scheduleApprovalResync(session.linkedSessionId);
-        } else {
-          this.clearApprovalResync(session.linkedSessionId);
-        }
       } else {
         this.telegram.clearApprovalTracking(session.id);
         this.clearApprovalResync(session.linkedSessionId);
@@ -300,38 +295,21 @@ export class BridgeService {
   private async handleStructuredSessionUpdated(
     structuredSession: SessionSnapshot,
   ): Promise<void> {
-    const sessions = this.getTelegramManagedSessions(
-      this.tmux.refreshSessionFacts(structuredSession.id),
-    );
-    const linkedTargets = sessions.filter(
-      (session) => session.linkedSessionId === structuredSession.id,
-    );
-    const structuredStillWaiting =
-      structuredSession.runtimeState === "waitingApproval" &&
-      Boolean(structuredSession.activeApproval ?? structuredSession.pendingApprovals?.[0]);
+    const { sessions, linkedTargets } = this.getLinkedTargetContext(structuredSession.id);
+    const structuredStillWaiting = hasStructuredApprovalWaiting(structuredSession);
 
     for (const target of linkedTargets) {
-      if (!structuredStillWaiting) {
+      if (!structuredStillWaiting && !hasTmuxFallbackApproval(target)) {
         this.telegram.clearApprovalTracking(target.id);
       }
     }
 
-    const delivered = await this.syncActiveApprovalsToTelegram(
-      linkedTargets,
+    await this.syncLinkedApprovalsWithResync(
       structuredSession.id,
+      linkedTargets,
+      "sessionUpdated",
+      structuredSession,
     );
-    if (structuredStillWaiting && !delivered) {
-      logger.info("app", "linked 审批首拍未送达，等待重试", {
-        source: "sessionUpdated",
-        linkedSessionId: structuredSession.id,
-        activeApprovalCallId: structuredSession.activeApproval?.callId ?? null,
-        pendingCount: structuredSession.pendingApprovals?.length ?? 0,
-        targetSessionIds: linkedTargets.map((target) => target.id),
-      });
-      this.scheduleApprovalResync(structuredSession.id);
-    } else {
-      this.clearApprovalResync(structuredSession.id);
-    }
 
     this.queueBackgroundUiSync(sessions);
     await this.syncStructuredPanelsIfNeeded(sessions);
@@ -340,12 +318,7 @@ export class BridgeService {
   private async handleStructuredApprovalUpdated(
     approval: ApprovalRequest,
   ): Promise<void> {
-    const sessions = this.getTelegramManagedSessions(
-      this.tmux.refreshSessionFacts(approval.sessionId),
-    );
-    const linkedTargets = sessions.filter(
-      (session) => session.linkedSessionId === approval.sessionId,
-    );
+    const { sessions, linkedTargets } = this.getLinkedTargetContext(approval.sessionId);
 
     if (approval.status !== "pending") {
       for (const target of linkedTargets) {
@@ -358,21 +331,11 @@ export class BridgeService {
       }
       this.clearApprovalResync(approval.sessionId);
     } else {
-      const delivered = await this.syncActiveApprovalsToTelegram(
-        linkedTargets,
+      await this.syncLinkedApprovalsWithResync(
         approval.sessionId,
+        linkedTargets,
+        "approvalUpdated",
       );
-      if (!delivered) {
-        logger.info("app", "linked 审批首拍未送达，等待重试", {
-          source: "approvalUpdated",
-          linkedSessionId: approval.sessionId,
-          approvalCallId: approval.callId ?? null,
-          targetSessionIds: linkedTargets.map((target) => target.id),
-        });
-        this.scheduleApprovalResync(approval.sessionId);
-      } else {
-        this.clearApprovalResync(approval.sessionId);
-      }
     }
 
     this.queueBackgroundUiSync(sessions);
@@ -418,87 +381,89 @@ export class BridgeService {
     linkedSessionId: string,
   ): Promise<boolean> {
     const structuredSession = this.sessionIndex.getSession(linkedSessionId);
-    const activeApproval =
-      structuredSession?.activeApproval ??
-      structuredSession?.pendingApprovals?.[0] ??
-      null;
-    if (!activeApproval) {
-      let deliveredFallback = false;
-      for (const session of sessions) {
-        const paneApproval = session.visibleApproval ?? session.activeApproval ?? null;
-        if (!paneApproval || paneApproval.rawMethod !== "tmux/paneApproval") {
-          continue;
-        }
-
-        logger.info("app", "linked 审批同步发送 Telegram 卡片（tmux 兜底）", {
-          linkedSessionId,
-          targetSessionId: session.id,
-          approvalSignature: paneApproval.signature ?? null,
-        });
-        await this.telegram.sendApprovalRequest({
-          ...paneApproval,
-          sessionId: session.id,
-          linkedSessionId,
-        });
-        deliveredFallback = true;
-      }
-      if (deliveredFallback) {
-        return true;
-      }
-
-      logger.info("app", "linked 审批同步跳过：当前没有 activeApproval", {
-        linkedSessionId,
-        targetSessionIds: sessions.map((session) => session.id),
-      });
-      return false;
-    }
-
+    const plan = buildLinkedApprovalPlan(structuredSession, sessions);
     let delivered = false;
-    for (const session of sessions) {
-      const visibleApproval = session.visibleApproval;
-      const visibleApprovalId = getApprovalIdentity(visibleApproval);
-      const visiblePendingApproval = visibleApprovalId
-        ? (structuredSession?.pendingApprovals?.find(
-            (approval) => getApprovalIdentity(approval) === visibleApprovalId,
-          ) ?? null)
-        : null;
-      const approvalToSend = visiblePendingApproval ?? activeApproval;
-      const approvalToSendId = getApprovalIdentity(approvalToSend);
-      const matchesVisibleApproval =
-        visibleApproval && visibleApprovalId === approvalToSendId;
-      const canFallbackToSingleVisiblePrompt =
-        !visibleApproval &&
-        (structuredSession?.pendingApprovals?.length ?? 0) <= 1 &&
-        hasVisibleApprovalPrompt(session.screenPreview ?? "");
-      if (!matchesVisibleApproval && !canFallbackToSingleVisiblePrompt) {
+    for (const skipped of plan.skips) {
+      if (skipped.selection.reason === "pane_not_aligned") {
         logger.info("app", "linked 审批同步跳过：pane 前台尚未对齐", {
           linkedSessionId,
-          targetSessionId: session.id,
-          activeApprovalCallId: activeApproval.callId ?? null,
-          visibleApprovalCallId: visibleApproval?.callId ?? null,
+          targetSessionId: skipped.target.id,
+          activeApprovalCallId: structuredSession?.activeApproval?.callId ?? null,
+          visibleApprovalCallId: skipped.target.visibleApproval?.callId ?? null,
           pendingCount: structuredSession?.pendingApprovals?.length ?? 0,
-          screenHasApprovalPrompt: hasVisibleApprovalPrompt(session.screenPreview ?? ""),
+          screenHasApprovalPrompt: Boolean(skipped.target.screenPreview),
         });
+      }
+    }
+
+    for (const dispatch of plan.dispatches) {
+      if (dispatch.selection.kind === "fallback") {
+        logger.info("app", "linked 审批同步发送 Telegram 卡片（tmux 兜底）", {
+          linkedSessionId,
+          targetSessionId: dispatch.target.id,
+          approvalSignature: dispatch.selection.approval.signature ?? null,
+        });
+        await this.telegram.sendApprovalRequest({
+          ...dispatch.selection.approval,
+          sessionId: dispatch.target.id,
+          linkedSessionId,
+        });
+        delivered = true;
         continue;
       }
 
       logger.info("app", "linked 审批同步发送 Telegram 卡片", {
         linkedSessionId,
-        targetSessionId: session.id,
-        activeApprovalCallId: activeApproval.callId ?? null,
-        approvalToSendCallId: approvalToSend.callId ?? null,
-        visibleApprovalCallId: visibleApproval?.callId ?? null,
+        targetSessionId: dispatch.target.id,
+        activeApprovalCallId: dispatch.selection.activeApproval.callId ?? null,
+        approvalToSendCallId: dispatch.selection.approval.callId ?? null,
+        visibleApprovalCallId: dispatch.target.visibleApproval?.callId ?? null,
         paneVisibleDiffersFromStructuredActive:
-          Boolean(visiblePendingApproval) &&
-          approvalToSendId !== getApprovalIdentity(activeApproval),
-        fallbackToSingleVisiblePrompt: !matchesVisibleApproval,
+          dispatch.selection.paneVisibleDiffersFromStructuredActive,
+        fallbackToSingleVisiblePrompt: dispatch.selection.fallbackToSingleVisiblePrompt,
       });
       await this.telegram.sendApprovalRequest({
-        ...approvalToSend,
-        sessionId: session.id,
+        ...dispatch.selection.approval,
+        sessionId: dispatch.target.id,
         linkedSessionId,
       });
       delivered = true;
+    }
+
+    if (!delivered && !structuredSession?.activeApproval && !(structuredSession?.pendingApprovals?.[0])) {
+      logger.info("app", "linked 审批同步跳过：当前没有 activeApproval", {
+        linkedSessionId,
+        targetSessionIds: sessions.map((session) => session.id),
+      });
+    }
+
+    return delivered;
+  }
+
+  private async syncLinkedApprovalsWithResync(
+    linkedSessionId: string,
+    linkedTargets: SessionSnapshot[],
+    source: "paneChanged" | "sessionUpdated" | "approvalUpdated" | "resync",
+    structuredSession?: SessionSnapshot,
+  ): Promise<boolean> {
+    const delivered = await this.syncActiveApprovalsToTelegram(
+      linkedTargets,
+      linkedSessionId,
+    );
+
+    const currentStructuredSession =
+      structuredSession ?? this.sessionIndex.getSession(linkedSessionId);
+    if (hasStructuredApprovalWaiting(currentStructuredSession) && !delivered) {
+      logger.info("app", "linked 审批首拍未送达，等待重试", {
+        source,
+        linkedSessionId,
+        activeApprovalCallId: currentStructuredSession?.activeApproval?.callId ?? null,
+        pendingCount: currentStructuredSession?.pendingApprovals?.length ?? 0,
+        targetSessionIds: linkedTargets.map((target) => target.id),
+      });
+      this.scheduleApprovalResync(linkedSessionId);
+    } else {
+      this.clearApprovalResync(linkedSessionId);
     }
 
     return delivered;
@@ -535,15 +500,11 @@ export class BridgeService {
       linkedSessionId,
       attempt: attempt + 1,
     });
-    const sessions = this.getTelegramManagedSessions(
-      this.tmux.refreshSessionFacts(linkedSessionId),
-    );
-    const linkedTargets = sessions.filter(
-      (candidate) => candidate.linkedSessionId === linkedSessionId,
-    );
-    const delivered = await this.syncActiveApprovalsToTelegram(
-      linkedTargets,
+    const { linkedTargets, structuredSession } = this.getLinkedTargetContext(linkedSessionId);
+    const delivered = await this.syncLinkedApprovalsWithResync(
       linkedSessionId,
+      linkedTargets,
+      "resync",
     );
     if (delivered) {
       logger.info("app", "linked 审批重试送达成功", {
@@ -554,10 +515,7 @@ export class BridgeService {
       return;
     }
 
-    const structuredSession = this.sessionIndex.getSession(linkedSessionId);
-    const stillWaiting =
-      structuredSession?.runtimeState === "waitingApproval" &&
-      Boolean(structuredSession.activeApproval ?? structuredSession.pendingApprovals?.[0]);
+    const stillWaiting = hasStructuredApprovalWaiting(structuredSession);
     if (!stillWaiting) {
       logger.info("app", "linked 审批重试结束：审批已不再等待", {
         linkedSessionId,
@@ -576,6 +534,23 @@ export class BridgeService {
       clearTimeout(timer);
       this.approvalResyncTimerByLinkedSessionId.delete(linkedSessionId);
     }
+  }
+
+  private getLinkedTargetContext(linkedSessionId: string): {
+    sessions: SessionSnapshot[];
+    linkedTargets: SessionSnapshot[];
+    structuredSession: SessionSnapshot | undefined;
+  } {
+    const sessions = this.getTelegramManagedSessions(
+      this.tmux.refreshSessionFacts(linkedSessionId),
+    );
+    return {
+      sessions,
+      linkedTargets: sessions.filter(
+        (candidate) => candidate.linkedSessionId === linkedSessionId,
+      ),
+      structuredSession: this.sessionIndex.getSession(linkedSessionId),
+    };
   }
 
   private getTelegramManagedSessions(
@@ -608,12 +583,4 @@ const buildSessionStateSignature = (session: SessionSnapshot): string => {
     preview: session.preview ?? null,
     footer: session.codexFooterStatus ?? null,
   });
-};
-
-const getApprovalIdentity = (approval?: ApprovalRequest | null): string => {
-  if (!approval) {
-    return "";
-  }
-
-  return approval.callId ?? approval.signature ?? approval.command ?? String(approval.requestId);
 };

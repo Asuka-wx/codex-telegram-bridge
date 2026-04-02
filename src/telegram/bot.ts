@@ -3,9 +3,14 @@ import { randomBytes } from "node:crypto";
 import { Bot, InlineKeyboard, type Context, GrammyError, HttpError } from "grammy";
 
 import type { BridgeService } from "../app/bridge-service.js";
+import { ApprovalCoordinator } from "../approval/approval-coordinator.js";
+import {
+  getApprovalIdentity,
+} from "../approval/approval-identity.js";
 import type { SyncMode } from "../app/state-store.js";
 import { config, isUserAllowed } from "../config.js";
 import type {
+  ApprovalActionKey,
   ApprovalRequest,
   SessionMessage,
   SessionSnapshot,
@@ -13,43 +18,238 @@ import type {
 } from "../types/domain.js";
 import { logger } from "../utils/logger.js";
 import {
-  isBuiltInTelegramCommand,
-  parseApprovalTokenAction,
-  parseChatIntent,
-  parseSessionSelection,
-  parseToolOutputAction,
-  parseTrailingSegment,
-  type TelegramChatIntent,
-} from "./callbacks.js";
-import {
   formatApprovalRequest,
   formatControlSummary,
   formatSessionMessage,
   formatSessionSummary,
 } from "./formatters.js";
-import { getGroupReadinessAdvice } from "./group-readiness.js";
-import {
-  buildCollapsedToolOutputKeyboard,
-  buildControlKeyboard,
-  buildSessionControlKeyboard,
-  buildSettingsKeyboard,
-  renderModeLabel,
-} from "./keyboards.js";
-import {
-  canMergeSemanticMessages,
-  formatCollapsedTelegramMessagePreview,
-  formatTelegramChunk,
-  mergeSemanticMessages,
-  shouldBufferSemanticMessage,
-  shouldCollapseTelegramMessage,
-} from "./message-formatting.js";
 
 type BotContext = Context;
 
-const bi = (zh: string, en: string): string => `${zh} / ${en}`;
+const APPROVAL_ACTION_KEYS = [
+  "Enter",
+  "y",
+  "p",
+  "Escape",
+  "n",
+  "C-c",
+  "DownEnter",
+  "DownDownEnter",
+  "DownDownDownEnter",
+] as const satisfies ApprovalActionKey[];
+
+export const parseSessionSelection = (data: string): string =>
+  data.replace("session:select:", "");
+
+export const parseApprovalDecision = (data: string) => {
+  const payload = data.replace("approval:", "");
+  const separatorIndex = payload.lastIndexOf(":");
+  const decision = separatorIndex === -1 ? "" : payload.slice(separatorIndex + 1);
+  return {
+    sessionId: separatorIndex === -1 ? "" : payload.slice(0, separatorIndex),
+    decision: decision as
+      | "accept"
+      | "acceptRemember"
+      | "acceptForSession"
+      | "decline"
+      | "cancel",
+  };
+};
+
+export const parseTrailingSegment = (
+  data: string,
+  prefix: string,
+): { sessionId: string; suffix: string } => {
+  const payload = data.replace(prefix, "");
+  const separatorIndex = payload.lastIndexOf(":");
+  if (separatorIndex === -1) {
+    return {
+      sessionId: "",
+      suffix: "",
+    };
+  }
+
+  return {
+    sessionId: payload.slice(0, separatorIndex),
+    suffix: payload.slice(separatorIndex + 1),
+  };
+};
+
+export const parseApprovalAction = (
+  data: string,
+): { sessionId: string; key: ApprovalActionKey | "" } => {
+  const { sessionId, suffix } = parseTrailingSegment(data, "approvalKey:");
+  const key = (
+    APPROVAL_ACTION_KEYS.includes(suffix as ApprovalActionKey)
+      ? suffix
+      : ""
+  ) as ApprovalActionKey | "";
+  return {
+    sessionId,
+    key,
+  };
+};
+
+export const parseApprovalTokenAction = (
+  data: string,
+): { requestToken: string; key: ApprovalActionKey | "" } => {
+  const { sessionId: requestToken, suffix } = parseTrailingSegment(
+    data,
+    "approvalToken:",
+  );
+  const key = (
+    APPROVAL_ACTION_KEYS.includes(suffix as ApprovalActionKey)
+      ? suffix
+      : ""
+  ) as ApprovalActionKey | "";
+  return {
+    requestToken,
+    key,
+  };
+};
+
+export const parseToolOutputAction = (
+  data: string,
+): { requestToken: string; action: "open" | "" } => {
+  const { sessionId: requestToken, suffix } = parseTrailingSegment(
+    data,
+    "toolOutput:",
+  );
+  return {
+    requestToken,
+    action: suffix === "open" ? "open" : "",
+  };
+};
+
+const parseChatIntent = (text: string):
+  | { type: "mode"; mode: SyncMode }
+  | { type: "sessions" }
+  | { type: "bindLatest" }
+  | { type: "chatInfo" }
+  | { type: "groupReady" }
+  | { type: "setControl" }
+  | { type: "clearControl" }
+  | { type: "status" }
+  | { type: "interrupt" }
+  | { type: "key"; key: "Enter" | "y" | "p" | "Escape" | "C-c" }
+  | null => {
+  const normalized = text.trim();
+  if (["当前信息", "本群信息", "聊天信息", "chat info"].includes(normalized)) {
+    return { type: "chatInfo" };
+  }
+  if (["检查群准备", "群准备", "group ready"].includes(normalized)) {
+    return { type: "groupReady" };
+  }
+  if (["设为总控", "设为总控群", "当前群设为总控"].includes(normalized)) {
+    return { type: "setControl" };
+  }
+  if (["取消总控", "清除总控群"].includes(normalized)) {
+    return { type: "clearControl" };
+  }
+  if (["总控", "窗口列表", "会话列表"].includes(normalized)) {
+    return { type: "sessions" };
+  }
+  if (["绑定最新窗口", "绑定最新", "接上当前窗口"].includes(normalized)) {
+    return { type: "bindLatest" };
+  }
+  if (["本地模式", "切到本地模式"].includes(normalized)) {
+    return { type: "mode", mode: "local" };
+  }
+  if (["提醒模式", "切到提醒模式", "混合模式", "切到混合模式"].includes(normalized)) {
+    return { type: "mode", mode: "hybrid" };
+  }
+  if (["远程模式", "切到远程模式"].includes(normalized)) {
+    return { type: "mode", mode: "remote" };
+  }
+  if (["状态", "查看状态", "当前状态"].includes(normalized)) {
+    return { type: "status" };
+  }
+  if (["中断", "停止", "停止当前任务"].includes(normalized)) {
+    return { type: "interrupt" };
+  }
+  if (["回车", "继续"].includes(normalized)) {
+    return { type: "key", key: "Enter" };
+  }
+  if (["允许", "同意"].includes(normalized)) {
+    return { type: "key", key: "y" };
+  }
+  if (["允许并记住", "持续允许", "记住这次选择"].includes(normalized)) {
+    return { type: "key", key: "p" };
+  }
+  if (["拒绝", "不同意"].includes(normalized)) {
+    return { type: "key", key: "Escape" };
+  }
+  if (["取消", "取消确认"].includes(normalized)) {
+    return { type: "key", key: "Escape" };
+  }
+  return null;
+};
 
 const isApprovalLikeKey = (key: "Enter" | "y" | "p" | "Escape" | "C-c"): boolean => {
   return key === "y" || key === "p" || key === "Escape";
+};
+
+const buildSessionControlKeyboard = (
+  sessionId: string,
+): InlineKeyboard | undefined => {
+  const callbackData = [
+    `control:status:${sessionId}`,
+    `control:key:${sessionId}:Enter`,
+    `control:key:${sessionId}:C-c`,
+    `sessionMode:set:${sessionId}:local`,
+    `sessionMode:set:${sessionId}:hybrid`,
+    `sessionMode:set:${sessionId}:remote`,
+  ];
+
+  if (callbackData.some((value) => Buffer.byteLength(value, "utf8") > 64)) {
+    return undefined;
+  }
+
+  return new InlineKeyboard()
+    .text("查看状态", callbackData[0] ?? "")
+    .row()
+    .text("继续", callbackData[1] ?? "")
+    .text("中断", callbackData[2] ?? "")
+    .row()
+    .text("本地模式", callbackData[3] ?? "")
+    .text("提醒模式", callbackData[4] ?? "")
+    .text("远程模式", callbackData[5] ?? "");
+};
+
+const buildControlKeyboard = (chatId: number) => {
+  const keyboard = new InlineKeyboard()
+    .text("刷新总控", "control:refresh")
+    .text("设置", "control:settings")
+    .row()
+    .text("本地模式", "control:mode:local")
+    .text("提醒模式", "control:mode:hybrid")
+    .text("远程模式", "control:mode:remote");
+
+  if (chatId > 0) {
+    keyboard
+      .row()
+      .text("绑定最新窗口", "control:bindLatest")
+      .text("查看当前状态", "control:currentStatus");
+  }
+
+  return keyboard;
+};
+
+const buildSettingsKeyboard = (chatId: number) => {
+  const keyboard = new InlineKeyboard()
+    .text("查看聊天信息", "control:chatInfo")
+    .text("检查群准备", "control:groupReady")
+    .row()
+    .text("设为总控", "control:setControl")
+    .text("取消总控", "control:clearControl")
+    .row()
+    .text("返回总控", "control:back");
+
+  if (chatId > 0) {
+    keyboard.row().text("绑定最新窗口", "control:bindLatest");
+  }
+
+  return keyboard;
 };
 
 const MAX_ARCHIVED_TOPIC_BINDINGS = 20;
@@ -58,9 +258,24 @@ const MESSAGE_RETRY_DELAY_MS = 5_000;
 const MAX_MESSAGE_DELIVERY_ATTEMPTS = 3;
 const DELIVERED_MESSAGE_TTL_MS = 5 * 60_000;
 const MAX_DELIVERED_MESSAGE_IDS = 2_000;
+const TOOL_OUTPUT_PREVIEW_MAX_LINES = 8;
+const TOOL_OUTPUT_PREVIEW_MAX_CHARS = 700;
+const COLLAPSE_TOOL_OUTPUT_LINE_THRESHOLD = 18;
+const COLLAPSE_TOOL_OUTPUT_CHAR_THRESHOLD = 1_200;
 const COLLAPSED_MESSAGE_TTL_MS = 12 * 60 * 60_000;
 const COMMENTARY_MERGE_WINDOW_MS = 1_200;
-const APPROVAL_KEY_SEPARATOR = "__CODEX_BRIDGE_APPROVAL__";
+const BUILTIN_TELEGRAM_COMMANDS = new Set([
+  "start",
+  "help",
+  "chatinfo",
+  "groupready",
+  "setcontrol",
+  "clearcontrol",
+  "sessions",
+  "bind",
+  "status",
+  "interrupt",
+]);
 
 interface DeliveryTarget {
   chatId: number;
@@ -89,6 +304,20 @@ interface PendingMergedMessageBuffer {
   timer: NodeJS.Timeout;
 }
 
+interface GroupReadinessAdviceInput {
+  chatId: number;
+  currentControlChatId: number | null;
+  status: string;
+  canManageTopics: string;
+  isForum: string;
+  enableForumTopics: boolean;
+}
+
+interface GroupReadinessAdvice {
+  recommendedState: string;
+  nextStep: string;
+}
+
 export class TelegramBotService {
   private readonly bot = new Bot<BotContext>(config.telegram.token);
 
@@ -101,24 +330,7 @@ export class TelegramBotService {
 
   private readonly telegramBackoffUntil = new Map<string, number>();
 
-  private readonly activeApprovalStateBySession = new Map<
-    string,
-    { requestToken: string; callId: string }
-  >();
-
-  private readonly approvalSessionByToken = new Map<string, string>();
-
-  private readonly approvalSignatureByToken = new Map<string, string>();
-
-  private readonly approvalTokenBySessionSignature = new Map<string, string>();
-
-  private readonly activeApprovalSignatureByTarget = new Map<string, string>();
-
-  private readonly pendingApprovalSubmitTokens = new Set<string>();
-
-  private readonly pendingApprovalByToken = new Map<string, ApprovalRequest>();
-
-  private readonly pendingApprovalRetryTokens = new Set<string>();
+  private readonly approvalCoordinator: ApprovalCoordinator;
 
   private readonly pendingMessageDeliveries = new Map<string, PendingMessageDelivery>();
 
@@ -134,8 +346,52 @@ export class TelegramBotService {
 
   private messageRetryTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly bridge: BridgeService) {
+  constructor(
+    private readonly bridge: BridgeService,
+    approvalCoordinator?: ApprovalCoordinator,
+  ) {
+    this.approvalCoordinator =
+      approvalCoordinator ??
+      new ApprovalCoordinator((sessionId) =>
+        this.bridge.getSessionFresh(sessionId),
+      );
     this.registerHandlers();
+  }
+
+  private get activeApprovalStateBySession() {
+    return this.approvalCoordinator.activeStateBySession;
+  }
+
+  private get approvalSessionByToken() {
+    return this.approvalCoordinator.sessionByToken;
+  }
+
+  private get approvalSignatureByToken() {
+    return this.approvalCoordinator.signatureByToken;
+  }
+
+  private get approvalTokenBySessionSignature() {
+    return this.approvalCoordinator.tokenBySessionSignature;
+  }
+
+  private get activeApprovalSignatureByTarget() {
+    return this.approvalCoordinator.activeSignatureByTarget;
+  }
+
+  private get pendingApprovalSubmitTokens() {
+    return this.approvalCoordinator.pendingSubmitTokens;
+  }
+
+  private get pendingApprovalByToken() {
+    return this.approvalCoordinator.pendingApprovalMap;
+  }
+
+  private get pendingApprovalRetryTokens() {
+    return this.approvalCoordinator.pendingRetryTokens;
+  }
+
+  private get approvalDispatchQueueBySession() {
+    return this.approvalCoordinator.dispatchQueueBySession;
   }
 
   async start(): Promise<void> {
@@ -183,54 +439,11 @@ export class TelegramBotService {
   }
 
   clearApprovalTracking(sessionId: string): void {
-    const current = this.activeApprovalStateBySession.get(sessionId);
-    if (current) {
-      this.approvalSessionByToken.delete(current.requestToken);
-      this.approvalSignatureByToken.delete(current.requestToken);
-      this.pendingApprovalSubmitTokens.delete(current.requestToken);
-      this.pendingApprovalRetryTokens.delete(current.requestToken);
-      this.pendingApprovalByToken.delete(current.requestToken);
-      this.activeApprovalStateBySession.delete(sessionId);
-    }
-    for (const requestToken of this.getApprovalTokensForSession(sessionId)) {
-      this.approvalSessionByToken.delete(requestToken);
-      this.approvalSignatureByToken.delete(requestToken);
-      this.pendingApprovalSubmitTokens.delete(requestToken);
-      this.pendingApprovalRetryTokens.delete(requestToken);
-      this.pendingApprovalByToken.delete(requestToken);
-    }
-
-    for (const approvalKey of this.getApprovalKeysForSession(sessionId)) {
-      this.approvalTokenBySessionSignature.delete(approvalKey);
-    }
-
-    for (const key of [...this.activeApprovalSignatureByTarget.keys()]) {
-      if (key.endsWith(`:${sessionId}`)) {
-        this.activeApprovalSignatureByTarget.delete(key);
-      }
-    }
+    this.approvalCoordinator.clearApprovalTracking(sessionId);
   }
 
   private hasActiveApprovalPressure(sessionId?: string): boolean {
-    if (sessionId) {
-      return (
-        this.getApprovalTokensForSession(sessionId).length > 0 ||
-        this.activeApprovalStateBySession.has(sessionId) ||
-        [...this.pendingApprovalRetryTokens].some((token) =>
-          this.approvalSessionByToken.get(token) === sessionId,
-        ) ||
-        [...this.pendingApprovalSubmitTokens].some((token) =>
-          this.approvalSessionByToken.get(token) === sessionId,
-        )
-      );
-    }
-
-    return (
-      this.approvalSessionByToken.size > 0 ||
-      this.activeApprovalStateBySession.size > 0 ||
-      this.pendingApprovalRetryTokens.size > 0 ||
-      this.pendingApprovalSubmitTokens.size > 0
-    );
+    return this.approvalCoordinator.hasActiveApprovalPressure(sessionId);
   }
 
   private clearPendingMessageDeliveriesForSession(sessionId: string): void {
@@ -239,92 +452,6 @@ export class TelegramBotService {
         this.pendingMessageDeliveries.delete(key);
       }
     }
-  }
-
-  private getApprovalTokensForSession(sessionId: string): string[] {
-    return [...this.approvalSessionByToken.entries()]
-      .filter(([, mappedSessionId]) => mappedSessionId === sessionId)
-      .map(([requestToken]) => requestToken);
-  }
-
-  private getApprovalKeysForSession(sessionId: string): string[] {
-    return [...this.approvalTokenBySessionSignature.keys()].filter(
-      (approvalKey) => getApprovalKeySessionId(approvalKey) === sessionId,
-    );
-  }
-
-  private findApprovalToken(sessionId: string, approvalId: string): string | null {
-    const approvalKey = buildApprovalKey(sessionId, approvalId);
-    const token = this.approvalTokenBySessionSignature.get(approvalKey);
-    if (token) {
-      return token;
-    }
-    return this.getApprovalTokensForSession(sessionId).find((requestToken) => {
-      const approval = this.pendingApprovalByToken.get(requestToken);
-      return approval ? getApprovalIdentity(approval) === approvalId : false;
-    }) ?? null;
-  }
-
-  handleApprovalResolution(sessionId: string, approvalId: string): void {
-    for (const [requestToken, approval] of this.pendingApprovalByToken.entries()) {
-      if (
-        approval.sessionId !== sessionId ||
-        getApprovalIdentity(approval) !== approvalId
-      ) {
-        continue;
-      }
-
-      this.pendingApprovalByToken.delete(requestToken);
-      this.pendingApprovalSubmitTokens.delete(requestToken);
-      this.pendingApprovalRetryTokens.delete(requestToken);
-      this.approvalSessionByToken.delete(requestToken);
-      this.approvalSignatureByToken.delete(requestToken);
-    }
-
-    const approvalKey = buildApprovalKey(sessionId, approvalId);
-    this.approvalTokenBySessionSignature.delete(approvalKey);
-
-    const activeState = this.activeApprovalStateBySession.get(sessionId);
-    if (activeState?.callId === approvalId) {
-      this.activeApprovalStateBySession.delete(sessionId);
-    }
-
-    for (const key of [...this.activeApprovalSignatureByTarget.keys()]) {
-      if (!key.endsWith(`:${sessionId}`)) {
-        continue;
-      }
-      if (this.activeApprovalSignatureByTarget.get(key) === approvalId) {
-        this.activeApprovalSignatureByTarget.delete(key);
-      }
-    }
-  }
-
-  private scheduleApprovalTokenRelease(
-    sessionId: string,
-    requestToken: string,
-    signature: string,
-  ): void {
-    const timer = setTimeout(() => {
-      void (async () => {
-        const activeState = this.activeApprovalStateBySession.get(sessionId);
-        if (
-          activeState &&
-          activeState.requestToken === requestToken &&
-          activeState.callId === signature
-        ) {
-          const session = await this.bridge.getSessionFresh(sessionId);
-          if (
-            session?.runtimeState === "waitingApproval" &&
-            getApprovalIdentity(session.activeApproval ?? {}) === signature
-          ) {
-            this.approvalSessionByToken.set(requestToken, sessionId);
-            this.approvalSignatureByToken.set(requestToken, signature);
-          }
-        }
-        this.pendingApprovalSubmitTokens.delete(requestToken);
-      })();
-    }, 1500);
-    timer.unref();
   }
 
   private scheduleApprovalRetry(): void {
@@ -337,9 +464,7 @@ export class TelegramBotService {
 
     this.approvalRetryTimer = setTimeout(() => {
       this.approvalRetryTimer = null;
-      const pending = [...this.pendingApprovalRetryTokens]
-        .map((requestToken) => this.pendingApprovalByToken.get(requestToken))
-        .filter((approval): approval is ApprovalRequest => approval !== undefined);
+      const pending = this.approvalCoordinator.getRetryApprovals();
       for (const approval of pending) {
         void this.sendApprovalRequest(approval);
       }
@@ -348,6 +473,150 @@ export class TelegramBotService {
       }
     }, APPROVAL_RETRY_DELAY_MS);
     this.approvalRetryTimer.unref();
+  }
+
+  handleApprovalResolution(
+    sessionId: string,
+    approvalId: string,
+  ): void {
+    this.approvalCoordinator.handleApprovalResolution(sessionId, approvalId);
+  }
+
+  private async handleApprovalTokenAction(
+    ctx: BotContext,
+    requestToken: string,
+    key: ApprovalActionKey,
+  ): Promise<void> {
+    const sessionId = this.approvalSessionByToken.get(requestToken) ?? "";
+    const approval = this.pendingApprovalByToken.get(requestToken);
+    const approvalId = approval ? getApprovalIdentity(approval) : "";
+    const activeState =
+      sessionId ? this.activeApprovalStateBySession.get(sessionId) : undefined;
+    logger.info("收到审批按钮点击", {
+      sessionId: sessionId || null,
+      requestToken,
+      key,
+      approvalId: approvalId || null,
+      activeApprovalId: activeState?.callId ?? null,
+    });
+    if (this.pendingApprovalSubmitTokens.has(requestToken)) {
+      await this.answerCallbackQuerySafely(ctx, "审批处理中，请稍候。");
+      return;
+    }
+    if (
+      !sessionId ||
+      !approval ||
+      !approvalId ||
+      !activeState ||
+      activeState.requestToken !== requestToken ||
+      activeState.callId !== approvalId
+    ) {
+      await this.answerCallbackQuerySafely(ctx, "这条审批已经失效。");
+      await this.clearApprovalCallbackMarkup(ctx);
+      return;
+    }
+
+    const callbackAnswer = this.answerCallbackQuerySafely(
+      ctx,
+      "已收到审批动作，正在校验并提交。",
+    );
+
+    const submitted = await this.approvalCoordinator.submitApprovalAction(
+      requestToken,
+      key,
+      (resolvedSessionId, resolvedKey) =>
+        this.bridge.sendControl(resolvedSessionId, resolvedKey),
+    );
+    if (submitted.status === "busy") {
+      await callbackAnswer;
+      return;
+    }
+    if (submitted.status === "invalid") {
+      await callbackAnswer;
+      await this.clearApprovalCallbackMarkup(ctx);
+      await this.sendApprovalCallbackFollowUp(ctx, "这条审批已经失效。");
+      return;
+    }
+    if (
+      submitted.effectiveApprovalId &&
+      approvalId &&
+      submitted.effectiveApprovalId !== approvalId
+    ) {
+      logger.info("审批按钮点击已对齐到结构化审批身份", {
+        sessionId: submitted.sessionId,
+        requestToken,
+        previousApprovalId: approvalId,
+        effectiveApprovalId: submitted.effectiveApprovalId,
+      });
+    }
+
+    if (submitted.status === "failed") {
+      await callbackAnswer;
+      await this.sendApprovalCallbackFollowUp(
+        ctx,
+        "没有找到目标窗口，审批卡已恢复，可重试。",
+      );
+      return;
+    }
+
+    if (submitted.status === "error") {
+      logger.warn("审批动作提交失败", {
+        sessionId: submitted.sessionId,
+        approvalId: submitted.effectiveApprovalId ?? approvalId,
+        requestToken,
+        key,
+        error: submitted.error,
+      });
+      await callbackAnswer;
+      await this.sendApprovalCallbackFollowUp(
+        ctx,
+        "审批提交失败，请稍后重试。",
+      );
+      return;
+    }
+
+    await callbackAnswer;
+    await this.clearApprovalCallbackMarkup(ctx);
+  }
+
+  private async answerCallbackQuerySafely(
+    ctx: BotContext,
+    text: string,
+  ): Promise<void> {
+    try {
+      await ctx.answerCallbackQuery({ text });
+    } catch (error) {
+      logger.warn("Telegram callback 应答失败", {
+        text,
+        error,
+      });
+    }
+  }
+
+  private async clearApprovalCallbackMarkup(ctx: BotContext): Promise<void> {
+    await this.safeTelegram("approval:clearMarkup", async () => {
+      await ctx.editMessageReplyMarkup();
+    });
+  }
+
+  private async sendApprovalCallbackFollowUp(
+    ctx: BotContext,
+    text: string,
+  ): Promise<void> {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    const threadId = ctx.callbackQuery?.message?.message_thread_id;
+    await this.safeTelegram(
+      `approval:followUp:${chatId}:${threadId ?? 0}`,
+      async () => {
+        await this.bot.api.sendMessage(chatId, text, {
+          message_thread_id: threadId,
+        });
+      },
+    );
   }
 
   async syncControlTopics(sessions: SessionMessage[] | SessionSnapshot[]): Promise<void> {
@@ -715,44 +984,21 @@ export class TelegramBotService {
   }
 
   async sendApprovalRequest(approval: ApprovalRequest): Promise<void> {
+    await this.approvalCoordinator.enqueueDispatch(
+      approval.sessionId,
+      async () => this.sendApprovalRequestNow(approval),
+    );
+  }
+
+  private async sendApprovalRequestNow(approval: ApprovalRequest): Promise<void> {
     this.clearPendingMessageDeliveriesForSession(approval.sessionId);
 
     const targets = this.getDeliveryTargets(approval.sessionId);
-    const approvalId = getApprovalIdentity(approval);
-    const existingState = this.activeApprovalStateBySession.get(approval.sessionId);
-    if (existingState && existingState.callId !== approvalId) {
-      logger.info("已存在活动审批，忽略新的发卡请求", {
-        sessionId: approval.sessionId,
-        activeApprovalId: existingState.callId,
-        incomingApprovalId: approvalId,
-      });
+    const prepared = this.approvalCoordinator.prepareApprovalDispatch(approval);
+    if (!prepared) {
       return;
     }
-    const requestToken =
-      approval.requestToken ??
-      this.findApprovalToken(approval.sessionId, approvalId) ??
-      (existingState && existingState.callId === approvalId
-        ? existingState.requestToken
-        : createApprovalToken());
-
-    this.approvalTokenBySessionSignature.set(
-      buildApprovalKey(approval.sessionId, approvalId),
-      requestToken,
-    );
-    this.approvalSessionByToken.set(requestToken, approval.sessionId);
-    this.approvalSignatureByToken.set(requestToken, approvalId);
-
-    const queuedApproval: ApprovalRequest = {
-      ...approval,
-      requestToken,
-      callId: approval.callId ?? approvalId,
-      signature: approval.signature ?? approvalId,
-    };
-    this.pendingApprovalByToken.set(requestToken, queuedApproval);
-    this.activeApprovalStateBySession.set(approval.sessionId, {
-      requestToken,
-      callId: approvalId,
-    });
+    const { approvalId, requestToken, queuedApproval } = prepared;
 
     const actions = approval.actions?.length
       ? approval.actions
@@ -774,7 +1020,7 @@ export class TelegramBotService {
         sessionId: approval.sessionId,
         requestId: approval.requestId,
       });
-      this.pendingApprovalRetryTokens.add(requestToken);
+      this.approvalCoordinator.queueRetry(requestToken);
       this.scheduleApprovalRetry();
       return;
     }
@@ -787,10 +1033,9 @@ export class TelegramBotService {
       }
 
       const targetKey = `${target.chatId}:${target.threadId ?? 0}:${approval.sessionId}`;
-      if (this.activeApprovalSignatureByTarget.get(targetKey) === approvalId) {
+      if (!this.approvalCoordinator.beginDispatchToTarget(targetKey, approvalId)) {
         continue;
       }
-      this.activeApprovalSignatureByTarget.set(targetKey, approvalId);
 
       const sent = await this.safeTelegram(
         `sendApprovalRequest:${target.chatId}:${target.threadId ?? 0}`,
@@ -803,34 +1048,20 @@ export class TelegramBotService {
         },
       );
       if (!sent) {
-        if (this.activeApprovalSignatureByTarget.get(targetKey) === approvalId) {
-          this.activeApprovalSignatureByTarget.delete(targetKey);
-        }
+        this.approvalCoordinator.rollbackDispatchToTarget(targetKey, approvalId);
         hadFailure = true;
       }
     }
 
-    if (delivered) {
-      logger.info("审批消息已送达 Telegram", {
-        sessionId: approval.sessionId,
-        requestId: approval.requestId,
-      });
-      this.activeApprovalStateBySession.set(approval.sessionId, {
-        requestToken,
-        callId: approvalId,
-      });
-    }
-
+    this.approvalCoordinator.finalizeApprovalDispatch(
+      approval,
+      requestToken,
+      approvalId,
+      delivered,
+      hadFailure,
+    );
     if (hadFailure) {
-      logger.warn("审批消息未即时送达，已进入重试队列", {
-        sessionId: approval.sessionId,
-        requestId: approval.requestId,
-        delivered,
-      });
-      this.pendingApprovalRetryTokens.add(requestToken);
       this.scheduleApprovalRetry();
-    } else {
-      this.pendingApprovalRetryTokens.delete(requestToken);
     }
   }
 
@@ -1239,84 +1470,21 @@ export class TelegramBotService {
       }
 
       if (data.startsWith("approval:")) {
-        await ctx.editMessageReplyMarkup();
-        await ctx.answerCallbackQuery({ text: "这张旧审批卡已失效，请使用最新审批卡。" });
+        await this.answerCallbackQuerySafely(
+          ctx,
+          "这张旧审批卡已失效，请使用最新审批卡。",
+        );
+        await this.clearApprovalCallbackMarkup(ctx);
         return;
       }
 
       if (data.startsWith("approvalToken:")) {
         const { requestToken, key } = parseApprovalTokenAction(data);
         if (!requestToken || !key) {
-          await ctx.answerCallbackQuery({ text: "审批参数无效。" });
+          await this.answerCallbackQuerySafely(ctx, "审批参数无效。");
           return;
         }
-
-        const sessionId = this.approvalSessionByToken.get(requestToken) ?? "";
-        const approval = this.pendingApprovalByToken.get(requestToken);
-        const approvalId = approval ? getApprovalIdentity(approval) : "";
-        const activeState =
-          sessionId ? this.activeApprovalStateBySession.get(sessionId) : undefined;
-        if (
-          !sessionId ||
-          !approval ||
-          !approvalId ||
-          !activeState ||
-          activeState.requestToken !== requestToken ||
-          activeState.callId !== approvalId
-        ) {
-          await ctx.editMessageReplyMarkup();
-          await ctx.answerCallbackQuery({ text: "这条审批已经失效。" });
-          return;
-        }
-
-        if (this.pendingApprovalSubmitTokens.has(requestToken)) {
-          await ctx.answerCallbackQuery({ text: "审批处理中，请稍候。" });
-          return;
-        }
-
-        const session = await this.bridge.getSessionFresh(sessionId);
-        const expectedApprovalId =
-          session?.activeApproval?.callId ??
-          session?.activeApproval?.signature ??
-          session?.activeApproval?.command ??
-          (session?.activeApproval
-            ? String(session.activeApproval.requestId)
-            : session?.pendingApprovals?.[0]?.callId ??
-              session?.pendingApprovals?.[0]?.signature ??
-              session?.pendingApprovals?.[0]?.command ??
-              (session?.pendingApprovals?.[0]
-                ? String(session.pendingApprovals[0].requestId)
-                : ""));
-        if (
-          !session ||
-          session.runtimeState !== "waitingApproval" ||
-          !expectedApprovalId ||
-          expectedApprovalId !== approvalId
-        ) {
-          this.handleApprovalResolution(sessionId, approvalId);
-          await ctx.editMessageReplyMarkup();
-          await ctx.answerCallbackQuery({ text: "这条审批已经失效。" });
-          return;
-        }
-
-        this.approvalSessionByToken.delete(requestToken);
-        this.approvalSignatureByToken.delete(requestToken);
-        this.pendingApprovalSubmitTokens.add(requestToken);
-        const success = await this.bridge.sendControl(sessionId, key);
-        if (!success) {
-          this.pendingApprovalSubmitTokens.delete(requestToken);
-          this.approvalSessionByToken.set(requestToken, sessionId);
-          this.approvalSignatureByToken.set(requestToken, approvalId);
-        } else {
-          this.scheduleApprovalTokenRelease(
-            sessionId,
-            requestToken,
-            approvalId,
-          );
-        }
-        await ctx.answerCallbackQuery({
-          text: success ? "已发送审批动作，等待窗口状态更新。" : "没有找到目标窗口。",
-        });
+        await this.handleApprovalTokenAction(ctx, requestToken, key);
         return;
       }
 
@@ -1329,7 +1497,8 @@ export class TelegramBotService {
 
         this.pruneCollapsedMessages();
         const pending = this.collapsedMessageByToken.get(requestToken);
-        const currentThreadId = ctx.callbackQuery.message?.message_thread_id;
+        const currentThreadId =
+          ctx.callbackQuery.message?.message_thread_id;
         if (
           !pending ||
           pending.target.chatId !== (ctx.chat?.id ?? 0) ||
@@ -1379,7 +1548,7 @@ export class TelegramBotService {
           isControlOverview &&
           (intent.type === "interrupt" || intent.type === "key")
         ) {
-          await ctx.reply("总控话题只做概览和全局控制。要继续、中断或审批具体任务，请进入对应任务子话题。");
+          await ctx.reply("总控话题只做概览和全局控制。要继续、中断或审批具体任务，请进入对应的 taskA / taskB 子话题。");
           return;
         }
         if (
@@ -1401,7 +1570,7 @@ export class TelegramBotService {
       const sessionId = this.resolveSessionIdFromContext(ctx);
       if (!sessionId) {
         if (this.isControlOverviewContext(ctx)) {
-          await ctx.reply("总控话题不直接承接任务输入。请进入对应任务子话题里继续对话。");
+          await ctx.reply("总控话题不直接承接任务输入。请进入对应的 taskA / taskB 子话题里继续对话。");
           return;
         }
         await ctx.reply("当前没有绑定窗口。先执行 /sessions 或直接发“绑定最新窗口”。");
@@ -1615,7 +1784,17 @@ export class TelegramBotService {
   private async handleIntent(
     ctx: BotContext,
     sessionId: string,
-    intent: TelegramChatIntent,
+    intent:
+      | { type: "mode"; mode: SyncMode }
+      | { type: "sessions" }
+      | { type: "bindLatest" }
+      | { type: "chatInfo" }
+      | { type: "groupReady" }
+      | { type: "setControl" }
+      | { type: "clearControl" }
+      | { type: "status" }
+      | { type: "interrupt" }
+      | { type: "key"; key: "Enter" | "y" | "p" | "Escape" | "C-c" },
   ): Promise<void> {
     const chatId = ctx.chat?.id;
     if (!chatId) {
@@ -1724,7 +1903,7 @@ export class TelegramBotService {
         await this.replyControlOverview(
           ctx,
           sessions,
-          "总控已刷新当前概览。要查看某个任务的详细状态，请进入对应任务子话题。",
+          "总控已刷新当前概览。要查看某个任务的详细状态，请进入对应的 taskA / taskB 子话题。",
         );
         return;
       }
@@ -1786,23 +1965,14 @@ export class TelegramBotService {
         chatId === undefined
           ? null
           : this.bridge.stateStore.getControlPanelMessageId(chatId);
-      const controlPanelThreadId =
-        chatId === undefined
-          ? null
-          : this.bridge.stateStore.getControlPanelThreadId(chatId);
       const callbackMessageId = ctx.callbackQuery?.message?.message_id ?? null;
 
       if (
         chatId !== undefined &&
         chatId < 0 &&
         controlChatId === chatId &&
-        (
-          (controlPanelThreadId !== null && controlPanelThreadId === topicId) ||
-          (
-            controlPanelMessageId !== null &&
-            callbackMessageId === controlPanelMessageId
-          )
-        )
+        controlPanelMessageId !== null &&
+        callbackMessageId === controlPanelMessageId
       ) {
         return {
           sessionId: null,
@@ -1883,7 +2053,7 @@ export class TelegramBotService {
     const isAllowedChat = this.bridge.stateStore.isAllowedChat(chatId);
 
     return [
-      bi("当前聊天信息", "Current Chat Info"),
+      "当前聊天信息：",
       `chatId: ${chat?.id ?? "unknown"}`,
       `chatType: ${chat?.type ?? "unknown"}`,
       `chatTitle: ${"title" in (chat ?? {}) ? (chat as { title?: string }).title ?? "" : ""}`,
@@ -1892,51 +2062,45 @@ export class TelegramBotService {
       `currentControlChatId: ${currentControlChatId ?? "unset"}`,
       `isAllowedChat: ${isAllowedChat}`,
       isAllowedChat
-        ? bi(
-            "下一步：如果你想把当前群设为总控，发送 /setcontrol 或直接发“设为总控”。",
-            "Next: if you want to use this chat as the control chat, send /setcontrol.",
-          )
-        : bi(
-            "下一步：当前群还不在允许列表里，但你可以直接发 /setcontrol 把它设为总控并加入运行时允许列表。",
-            "Next: this chat is not yet allowlisted, but you can send /setcontrol to make it the control chat and add it to the runtime allowlist.",
-          ),
+        ? "下一步：如果你想把当前群设为总控，发送 /setcontrol 或直接发“设为总控”。"
+        : "下一步：当前群还不在允许列表里，但你可以直接发 /setcontrol 把它设为总控并加入运行时允许列表。",
     ].join("\n");
   }
 
   private renderHelp(): string {
     return [
-      bi("Codex Telegram Bridge 已连接。", "Codex Telegram Bridge is connected."),
+      "Codex Telegram Bridge 已连接。",
       "",
-      bi("常用入口", "Common Actions"),
-      `- ${bi("总控", "Sessions")}`,
-      `- ${bi("当前信息", "/chatinfo")}`,
-      `- ${bi("检查群准备", "/groupready")}`,
-      `- ${bi("设为总控", "/setcontrol")}`,
-      `- ${bi("绑定最新窗口", "Bind Latest")}`,
-      `- ${bi("状态", "/status")}`,
-      `- ${bi("本地模式 / 提醒模式 / 远程模式", "Local / Hybrid / Remote mode")}`,
+      "常用入口：",
+      "- 总控",
+      "- 当前信息",
+      "- 检查群准备",
+      "- 设为总控",
+      "- 绑定最新窗口",
+      "- 状态",
+      "- 本地模式 / 提醒模式 / 远程模式",
       "",
-      bi("如果你准备切到正式私人群", "If you want to move to a private production-style group"),
-      `1. ${bi("先发“当前信息”", "Send /chatinfo")}`,
-      `2. ${bi("再发“检查群准备”", "Then send /groupready")}`,
-      `3. ${bi("然后发“设为总控”", "Then send /setcontrol")}`,
-      `4. ${bi("最后发“绑定最新窗口”", "Finally bind the latest session")}`,
+      "如果你准备切到正式私人群：",
+      "1. 先发“当前信息”",
+      "2. 再发“检查群准备”",
+      "3. 然后发“设为总控”",
+      "4. 最后发“绑定最新窗口”",
     ].join("\n");
   }
 
   private async renderGroupReadiness(ctx: BotContext): Promise<string> {
     const chat = ctx.chat;
     if (!chat) {
-      return bi("无法识别当前 chat。", "Unable to detect the current chat.");
+      return "无法识别当前 chat。";
     }
 
     if (chat.type === "private") {
       return [
-        bi("当前是私聊，不是群组。", "This is a private chat, not a group."),
-        bi("如果你准备切到正式群组形态", "If you want to switch to a production-style group"),
-        `1. ${bi("把 bot 拉进目标私人群", "Add the bot to your target private group")}`,
-        `2. ${bi("在群里发“当前信息”", "Send /chatinfo in that group")}`,
-        `3. ${bi("再发“设为总控”", "Then send /setcontrol")}`,
+        "当前是私聊，不是群组。",
+        "如果你准备切到正式群组形态：",
+        "1. 把 bot 拉进目标私人群",
+        "2. 在群里发“当前信息”",
+        "3. 再发“设为总控”",
       ].join("\n");
     }
 
@@ -2199,16 +2363,6 @@ export class TelegramBotService {
     const pending = [...this.pendingMessageDeliveries.values()];
 
     for (const delivery of pending) {
-      const stillMatched = this.getDeliveryTargets(delivery.message.sessionId).some(
-        (target) =>
-          target.chatId === delivery.target.chatId &&
-          target.threadId === delivery.target.threadId,
-      );
-      if (!stillMatched || !this.shouldForwardMessageToTarget(delivery.target, delivery.message)) {
-        this.pendingMessageDeliveries.delete(delivery.key);
-        continue;
-      }
-
       const result = await this.deliverMessageChunks(
         delivery.message,
         delivery.target,
@@ -2329,32 +2483,699 @@ const createApprovalToken = (): string => {
   return randomBytes(6).toString("hex");
 };
 
+const buildCollapsedToolOutputKeyboard = (
+  requestToken: string,
+): InlineKeyboard | undefined => {
+  const callbackData = `toolOutput:${requestToken}:open`;
+  if (Buffer.byteLength(callbackData, "utf8") > 64) {
+    return undefined;
+  }
+
+  return new InlineKeyboard().text("查看完整原文", callbackData);
+};
+
+const renderModeLabel = (mode: SyncMode): string => {
+  if (mode === "local") {
+    return "本地模式";
+  }
+  if (mode === "hybrid") {
+    return "提醒模式";
+  }
+  return "远程模式";
+};
+
+export const isBuiltInTelegramCommand = (text: string): boolean => {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) {
+    return false;
+  }
+
+  const token = trimmed.split(/\s+/, 1)[0] ?? "";
+  const command = token.slice(1).split("@", 1)[0]?.toLowerCase() ?? "";
+  return BUILTIN_TELEGRAM_COMMANDS.has(command);
+};
+
+export const getGroupReadinessAdvice = ({
+  chatId,
+  currentControlChatId,
+  status,
+  canManageTopics,
+  isForum,
+  enableForumTopics,
+}: GroupReadinessAdviceInput): GroupReadinessAdvice => {
+  if (currentControlChatId === chatId) {
+    return {
+      recommendedState: enableForumTopics
+        ? "建议目标状态：保持当前总控群可用，Topics 权限和 forum 状态不要被关闭。"
+        : "建议目标状态：保持当前总控群可用。",
+      nextStep: "当前群已经是总控群。下一步直接发“绑定最新窗口”。",
+    };
+  }
+
+  if (status !== "administrator" && status !== "creator") {
+    return {
+      recommendedState: enableForumTopics
+        ? "建议目标状态：bot 为 administrator，canManageTopics=true，群已开启 Topics。"
+        : "建议目标状态：bot 为 administrator。",
+      nextStep: "下一步：先把 bot 提升为管理员。",
+    };
+  }
+
+  if (enableForumTopics && isForum !== "true") {
+    return {
+      recommendedState:
+        "建议目标状态：bot 为 administrator，canManageTopics=true，群已开启 Topics。",
+      nextStep: "下一步：先把群组切换成 forum / Topics 模式，再发“设为总控”。",
+    };
+  }
+
+  if (enableForumTopics && canManageTopics !== "true") {
+    return {
+      recommendedState:
+        "建议目标状态：bot 为 administrator，canManageTopics=true，群已开启 Topics。",
+      nextStep: "下一步：先给 bot 打开 Topics 管理权限，再发“设为总控”。",
+    };
+  }
+
+  return {
+    recommendedState: enableForumTopics
+      ? "建议目标状态：bot 为 administrator，canManageTopics=true，群已开启 Topics。"
+      : "建议目标状态：bot 为 administrator。",
+    nextStep: "下一步：发“设为总控”，然后再发“绑定最新窗口”。",
+  };
+};
+
 const buildDeliveryTargetKey = (target: DeliveryTarget): string =>
   `${target.chatId}:${target.threadId ?? 0}`;
 
 const buildMessageDeliveryKey = (messageId: string, target: DeliveryTarget): string =>
   `${messageId}:${buildDeliveryTargetKey(target)}`;
 
-const buildApprovalKey = (sessionId: string, approvalId: string): string =>
-  `${sessionId}${APPROVAL_KEY_SEPARATOR}${approvalId}`;
+type TelegramChunkPayload = {
+  text: string;
+  parseMode?: "HTML";
+};
 
-const getApprovalKeySessionId = (approvalKey: string): string =>
-  approvalKey.split(APPROVAL_KEY_SEPARATOR, 1)[0] ?? "";
+export const shouldCollapseTelegramToolOutput = (
+  message: SessionMessage,
+): boolean => {
+  if (message.kind !== "tool" && message.role !== "tool") {
+    return false;
+  }
 
-const getApprovalIdentity = (
-  approval?: Partial<ApprovalRequest> | null,
+  const text = message.text.trim();
+  if (!text) {
+    return false;
+  }
+
+  const lineCount = text.split("\n").length;
+  return (
+    text.length > COLLAPSE_TOOL_OUTPUT_CHAR_THRESHOLD ||
+    lineCount > COLLAPSE_TOOL_OUTPUT_LINE_THRESHOLD
+  );
+};
+
+export const shouldCollapseTelegramSemanticMessage = (
+  message: SessionMessage,
+): boolean => {
+  void message;
+  return false;
+};
+
+export const shouldCollapseTelegramMessage = (
+  message: SessionMessage,
+): boolean => {
+  return shouldCollapseTelegramToolOutput(message);
+};
+
+export const formatCollapsedTelegramMessagePreview = (
+  message: SessionMessage,
+): TelegramChunkPayload => {
+  const text = message.text.trim() || "(空内容)";
+  const lines = text.split("\n");
+  const previewLines = buildToolPreviewLines(lines, TOOL_OUTPUT_PREVIEW_MAX_LINES);
+  let preview = previewLines.join("\n");
+  if (preview.length > TOOL_OUTPUT_PREVIEW_MAX_CHARS) {
+    preview = `${preview.slice(0, TOOL_OUTPUT_PREVIEW_MAX_CHARS - 3)}...`;
+  }
+
+  const omittedLines = Math.max(0, lines.length - previewLines.length);
+  const suffix =
+    omittedLines > 0 || preview.length < text.length
+      ? "其余内容已折叠，点击下方按钮查看完整内容。"
+      : "点击下方按钮查看完整内容。";
+
+  return {
+    text: [
+      "<b>【长工具输出已折叠】</b>",
+      `<b>长度：</b><code>${lines.length} 行 / ${text.length} 字符</code>`,
+      "<b>预览：</b>",
+      `<pre>${escapeHtml(preview)}</pre>`,
+      escapeHtml(suffix),
+    ].join("\n"),
+    parseMode: "HTML",
+  };
+};
+
+export const formatTelegramChunk = (
+  message: SessionMessage,
+  chunk: string,
+): TelegramChunkPayload => {
+  if (!shouldUseRichTelegramFormatting(message)) {
+    return { text: chunk };
+  }
+
+  const richText = formatRichTelegramText(message, chunk);
+  if (richText) {
+    return {
+      text: richText,
+      parseMode: "HTML",
+    };
+  }
+
+  if (looksPreformattedChunk(chunk)) {
+    return {
+      text: `<pre>${escapeHtml(chunk)}</pre>`,
+      parseMode: "HTML",
+    };
+  }
+
+  return {
+    text: chunk,
+  };
+};
+
+const buildToolPreviewLines = (lines: string[], maxLines: number): string[] => {
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  const nonEmptyLines = lines.filter((line) => line.trim());
+
+  const pushLine = (line: string): void => {
+    const normalized = line.trim();
+    if (!normalized || seen.has(normalized) || picked.length >= maxLines) {
+      return;
+    }
+    seen.add(normalized);
+    picked.push(line);
+  };
+
+  for (const line of nonEmptyLines) {
+    if (isHighSignalToolPreviewLine(line.trim())) {
+      pushLine(line);
+    }
+    if (picked.length >= maxLines) {
+      return picked;
+    }
+  }
+
+  if (picked.length > 0) {
+    return picked;
+  }
+
+  for (let index = nonEmptyLines.length - 1; index >= 0; index -= 1) {
+    pushLine(nonEmptyLines[index] ?? "");
+    if (picked.length >= maxLines) {
+      return picked;
+    }
+  }
+
+  for (const line of nonEmptyLines) {
+    pushLine(line);
+    if (picked.length >= maxLines) {
+      break;
+    }
+  }
+
+  return picked;
+};
+
+const isHighSignalToolPreviewLine = (line: string): boolean => {
+  return (
+    looksErrorSummaryLine(line) ||
+    looksKeyValueStatusLine(line) ||
+    looksCommandResultLine(line) ||
+    /^> /.test(line) ||
+    /^[$]/.test(line) ||
+    /^[✓✔✖✗]/.test(line) ||
+    /^(Error|[A-Z][A-Za-z0-9]+Error):/.test(line) ||
+    /\bexit\s+\d+\b/i.test(line) ||
+    /^(处理结果|当前进度|验证结果|结论|下一步|这部分在|代码片段|附加日志|现在的变化)(：|:|$)/.test(
+      line,
+    )
+  );
+};
+
+export const shouldBufferSemanticMessage = (message: SessionMessage): boolean => {
+  return (
+    message.source === "session_file" &&
+    message.role === "assistant" &&
+    message.phase === "commentary"
+  );
+};
+
+export const canMergeSemanticMessages = (
+  left: SessionMessage,
+  right: SessionMessage,
+): boolean => {
+  return (
+    shouldBufferSemanticMessage(left) &&
+    shouldBufferSemanticMessage(right) &&
+    left.sessionId === right.sessionId &&
+    left.source === right.source &&
+    left.role === right.role &&
+    (left.phase ?? null) === (right.phase ?? null)
+  );
+};
+
+export const mergeSemanticMessages = (
+  left: SessionMessage,
+  right: SessionMessage,
+): SessionMessage => {
+  return {
+    ...right,
+    id: `${left.id}+${right.id}`,
+    text: [left.text.trim(), right.text.trim()].filter(Boolean).join("\n\n"),
+    timestamp: right.timestamp,
+    turnId: right.turnId ?? left.turnId ?? null,
+  };
+};
+
+const formatRichTelegramText = (
+  message: SessionMessage,
+  text: string,
+): string | null => {
+  const semanticAssistant =
+    message.source === "session_file" && message.role === "assistant";
+  const lines = text.split("\n");
+  let usedMarkup = false;
+
+  const formatted = lines
+    .map((line, index) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return "";
+      }
+
+      if (isDividerLine(trimmed)) {
+        usedMarkup = true;
+        return "";
+      }
+
+      const sectionLabel = getSectionLabel(trimmed, lines[index + 1]?.trim() ?? "");
+      if (sectionLabel) {
+        usedMarkup = true;
+        const sectionBody = new RegExp(`^${escapeRegExp(sectionLabel)}[：:]?$`).test(trimmed)
+          ? ""
+          : trimmed;
+        const renderedSectionBody = renderSemanticParagraph(
+          sectionBody,
+          semanticAssistant,
+        );
+        return sectionBody
+          ? `${renderSectionHeading(sectionLabel)}\n${renderedSectionBody}`
+          : renderSectionHeading(sectionLabel);
+      }
+
+      if (trimmed.startsWith("• ")) {
+        usedMarkup = true;
+        return formatBulletLine(trimmed.slice(2), "•");
+      }
+
+      if (trimmed.startsWith("- ")) {
+        usedMarkup = true;
+        return formatBulletLine(trimmed.slice(2), "•");
+      }
+
+      if (/^\d+\.\s+/.test(trimmed)) {
+        usedMarkup = true;
+        return formatNumberedLine(trimmed);
+      }
+
+      if (
+        trimmed.startsWith("└ ") ||
+        trimmed.startsWith("├ ") ||
+        trimmed.startsWith("│ ")
+      ) {
+        usedMarkup = true;
+        return `<code>${escapeHtml(trimmed)}</code>`;
+      }
+
+      if (looksCommandResultLine(trimmed)) {
+        usedMarkup = true;
+        return `<code>${escapeHtml(trimmed)}</code>`;
+      }
+
+      if (looksErrorSummaryLine(trimmed)) {
+        usedMarkup = true;
+        return formatErrorSummaryLine(trimmed);
+      }
+
+      if (looksKeyValueStatusLine(trimmed)) {
+        usedMarkup = true;
+        return formatKeyValueLine(trimmed);
+      }
+
+      const maybeRichParagraph = renderSemanticParagraph(line, semanticAssistant);
+      if (maybeRichParagraph !== escapeHtml(line)) {
+        usedMarkup = true;
+        return maybeRichParagraph;
+      }
+
+      return maybeRichParagraph;
+    })
+    .join("\n")
+    .trim();
+
+  return usedMarkup ? formatted : null;
+};
+
+const looksPreformattedChunk = (text: string): boolean => {
+  const lines = text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== "");
+
+  if (lines.length === 0) {
+    return false;
+  }
+
+  const codeLikeLineCount = lines.filter(isCodeLikeLine).length;
+  if (codeLikeLineCount >= Math.max(2, Math.ceil(lines.length / 2))) {
+    return true;
+  }
+
+  return false;
+};
+
+const renderSectionHeading = (label: string): string => {
+  return `<b><u>【${escapeHtml(label)}】</u></b>`;
+};
+
+const renderSemanticParagraph = (
+  line: string,
+  semanticAssistant: boolean,
 ): string => {
-  if (!approval) {
+  const trimmed = line.trim();
+  if (!trimmed) {
     return "";
   }
-  if (approval.callId) {
-    return approval.callId;
+
+  const richParagraph = formatParagraphLine(trimmed);
+  if (!semanticAssistant) {
+    return richParagraph;
   }
-  if (approval.signature) {
-    return approval.signature;
+
+  if (shouldQuoteSemanticParagraph(trimmed)) {
+    return `<blockquote>${richParagraph}</blockquote>`;
   }
-  if (approval.command) {
-    return approval.command;
-  }
-  return approval.requestId !== undefined ? String(approval.requestId) : "";
+
+  return richParagraph;
 };
+
+const shouldQuoteSemanticParagraph = (text: string): boolean => {
+  if (text.length < 14) {
+    return false;
+  }
+
+  return (
+    /[，。；：]/.test(text) ||
+    /\bTG\b|\bTelegram\b/i.test(text) ||
+    text.startsWith("现在的变化") ||
+    text.startsWith("验证")
+  );
+};
+
+const shouldUseRichTelegramFormatting = (message: SessionMessage): boolean => {
+  return (
+    message.source === "tmux" ||
+    message.kind === "tool" ||
+    message.role === "tool" ||
+    (message.source === "session_file" && message.role === "assistant")
+  );
+};
+
+const isDividerLine = (line: string): boolean => /^[-─━]{8,}$/.test(line);
+
+const getSectionLabel = (line: string, nextLine: string): string | null => {
+  if (line.startsWith("当前进度")) {
+    return "当前进度";
+  }
+  if (line.startsWith("验证结果")) {
+    return "验证结果";
+  }
+  if (line.startsWith("结论")) {
+    return "结论";
+  }
+  if (line.startsWith("下一步")) {
+    return "下一步";
+  }
+  if (line.startsWith("说明")) {
+    return "说明";
+  }
+  if (line.startsWith("处理结果")) {
+    return "处理结果";
+  }
+  if (line.startsWith("现在的变化")) {
+    return "现在的变化";
+  }
+  if (line.startsWith("验证")) {
+    return "验证结果";
+  }
+  if (line.startsWith("剩余风险")) {
+    return "剩余风险";
+  }
+  if (line.startsWith("后续建议")) {
+    return "后续建议";
+  }
+  if (line.startsWith("常用入口")) {
+    return "常用入口";
+  }
+  if (line.startsWith("设计意图")) {
+    return "设计意图";
+  }
+  if (line.startsWith("群准备检查")) {
+    return "群准备检查";
+  }
+  if (line.startsWith("当前聊天信息")) {
+    return "当前聊天信息";
+  }
+  if (
+    line.endsWith("：") &&
+    line.length <= 24 &&
+    (nextLine.startsWith("- ") ||
+      nextLine.startsWith("• ") ||
+      /^\d+\.\s+/.test(nextLine))
+  ) {
+    return line.slice(0, -1);
+  }
+  return null;
+};
+
+const formatBulletLine = (text: string, marker: string): string => {
+  const labelMatch = text.match(/^([^：:]{1,24})([：:])\s*(.*)$/);
+  if (labelMatch) {
+    const [, head = "", , body = ""] = labelMatch;
+    return `${marker} <b>${escapeHtml(head)}：</b>${formatValueText(head, body)}`;
+  }
+  if (looksStandalonePathLike(text) || looksStandaloneCommand(text)) {
+    return `${marker} <code>${escapeHtml(text)}</code>`;
+  }
+  return `${marker} ${formatInlineText(text)}`;
+};
+
+const formatNumberedLine = (text: string): string => {
+  const match = text.match(/^(\d+)\.\s+(.*)$/);
+  if (!match) {
+    return formatInlineText(text);
+  }
+
+  const [, index = "", body = ""] = match;
+  return `<b>${escapeHtml(index)}.</b> ${formatInlineText(body)}`;
+};
+
+const formatParagraphLine = (line: string): string => {
+  if (looksStandalonePathLike(line.trim()) || looksStandaloneCommand(line.trim())) {
+    return `<code>${escapeHtml(line.trim())}</code>`;
+  }
+  return formatInlineText(line);
+};
+
+const formatInlineText = (text: string): string => {
+  const tokens: string[] = [];
+  let working = text;
+
+  const stash = (html: string): string => {
+    const token = `@@TOKEN_${tokens.length}@@`;
+    tokens.push(html);
+    return token;
+  };
+
+  working = working.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label: string) =>
+    stash(`<code>${escapeHtml(label)}</code>`),
+  );
+
+  working = working.replace(/`([^`]+)`/g, (_match, code: string) =>
+    stash(`<code>${escapeHtml(code)}</code>`),
+  );
+
+  working = working.replace(
+    /(?<!\w)(pnpm [\w:-]+|npm run [\w:-]+|tmux [\w:-]+|\/[a-z][\w-]*)(?!\w)/g,
+    (match: string) => stash(`<code>${escapeHtml(match)}</code>`),
+  );
+
+  working = working.replace(
+    /(?<!\w)((?:~\/|\.{1,2}\/|\/)?[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+(?::\d+(?::\d+)?)?)(?!\w)/g,
+    (match: string) => stash(`<code>${escapeHtml(match)}</code>`),
+  );
+
+  working = working.replace(
+    /\b([A-Za-z0-9._-]+\.(?:log|txt|md|json|js|jsx|ts|tsx|sh|plist|yaml|yml))\b/g,
+    (match: string) => stash(`<code>${escapeHtml(match)}</code>`),
+  );
+
+  working = working.replace(/\b(task[A-Za-z0-9_-]+)\b/g, (match: string) =>
+    stash(`<code>${escapeHtml(match)}</code>`),
+  );
+
+  let escaped = escapeHtml(working);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = `@@TOKEN_${index}@@`;
+    escaped = escaped.replace(token, tokens[index] ?? "");
+  }
+  return escaped;
+};
+
+const formatKeyValueLine = (line: string): string => {
+  const match = line.match(/^([^：:]{1,24})([：:])\s*(.*)$/);
+  if (!match) {
+    return formatInlineText(line);
+  }
+
+  const [, label = "", , value = ""] = match;
+  return `<b>${escapeHtml(label)}：</b>${formatValueText(label, value)}`;
+};
+
+const formatValueText = (label: string, value: string): string => {
+  const trimmedValue = value.trim();
+  if (!trimmedValue) {
+    return "";
+  }
+
+  if (shouldRenderValueAsCode(label, trimmedValue)) {
+    return `<code>${escapeHtml(trimmedValue)}</code>`;
+  }
+
+  return formatInlineText(trimmedValue);
+};
+
+const shouldRenderValueAsCode = (label: string, value: string): boolean => {
+  if (looksStandalonePathLike(value) || looksStandaloneCommand(value)) {
+    return true;
+  }
+
+  if (/^(exit \d+|[A-Z_]{2,}|[a-f0-9]{7,}|call_[A-Za-z0-9]+)$/i.test(value)) {
+    return true;
+  }
+
+  return /^(窗口|目录|界面目录|当前已绑定|会话|模型|上下文|文件|路径|日志|命令|Command|cwd|sessionId|callId|turnId|requestId|chatId|currentControlChatId|错误|失败|异常|Error)$/.test(
+    label,
+  );
+};
+
+const looksStandalonePathLike = (text: string): boolean => {
+  return /^(?:~\/|\.{1,2}\/|\/)?[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+(?::\d+(?::\d+)?)?$/.test(
+    text,
+  );
+};
+
+const looksStandaloneCommand = (text: string): boolean => {
+  return /^(?:(?:pnpm|npm|tmux|git|node|npx|python|python3|bash|zsh|sh|launchctl|codex|rg|sed|cat|tail|grep|find|ls|pwd|mkdir|rm|cp|mv|curl|wget|tsx|vitest|tsc|eslint)\b.*|\/[a-z][\w-]*(?:\s+.*)?)$/i.test(
+    text,
+  );
+};
+
+const looksErrorSummaryLine = (line: string): boolean => {
+  return /^(错误|失败|异常|Error|[A-Z][A-Za-z0-9]+Error)[：:]/.test(line);
+};
+
+const formatErrorSummaryLine = (line: string): string => {
+  const match = line.match(/^([^：:]{1,32})([：:])\s*(.*)$/);
+  if (!match) {
+    return `<b>错误：</b>${formatInlineText(line)}`;
+  }
+
+  const [, label = "", , value = ""] = match;
+  return `<b>${escapeHtml(label)}：</b>${formatValueText(label, value)}`;
+};
+
+const looksCommandResultLine = (line: string): boolean => {
+  return (
+    line.startsWith("$ ") ||
+    line.startsWith("> ") ||
+    line.startsWith("/status") ||
+    line.startsWith("/sessions") ||
+    line.startsWith("/bind") ||
+    /^Ran\b/.test(line) ||
+    /^Edited\b/.test(line) ||
+    /^Waited\b/.test(line) ||
+    /^Search(ed)?\b/.test(line)
+  );
+};
+
+const looksKeyValueStatusLine = (line: string): boolean => {
+  return /^(窗口|目录|消息模式|状态|最近更新|预览|当前模式|当前已绑定|窗口总数|运行中|提示|chatId|chatType|botStatus|canManageTopics|isForum|currentControlChatId|isAllowedChat|会话|模型|上下文|界面目录|文件|路径|日志|命令|结果|输出|原因|影响|建议|风险|callId|turnId|requestId|sessionId)(：|:)/.test(
+    line,
+  );
+};
+
+const isCodeLikeLine = (line: string): boolean => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  if (
+    trimmed.startsWith("$ ") ||
+    trimmed.startsWith("> ") ||
+    trimmed.startsWith("| ") ||
+    trimmed.startsWith("at ") ||
+    trimmed.startsWith("diff --git") ||
+    trimmed.startsWith("@@") ||
+    trimmed.startsWith("import ") ||
+    trimmed.startsWith("export ") ||
+    trimmed.startsWith("const ") ||
+    trimmed.startsWith("let ") ||
+    trimmed.startsWith("function ") ||
+    trimmed.startsWith("class ") ||
+    trimmed.startsWith("interface ") ||
+    trimmed.startsWith("type ") ||
+    trimmed.startsWith("return ") ||
+    trimmed.startsWith("if (") ||
+    trimmed.startsWith("for (") ||
+    trimmed.startsWith("while (")
+  ) {
+    return true;
+  }
+
+  if (
+    trimmed.includes("=>") ||
+    trimmed.includes("::") ||
+    trimmed.includes("</") ||
+    trimmed.includes("/>") ||
+    /^\s*[[\]{}();,]+$/.test(line) ||
+    /^([A-Z][A-Za-z0-9]+Error|Error):/.test(trimmed)
+  ) {
+    return true;
+  }
+
+  return false;
+};
+
+const escapeHtml = (text: string): string =>
+  text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+
+const escapeRegExp = (text: string): string =>
+  text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
