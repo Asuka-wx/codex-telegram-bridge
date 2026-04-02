@@ -9,7 +9,7 @@ import {
   shouldCollapseTelegramMessage,
   shouldCollapseTelegramSemanticMessage,
   shouldCollapseTelegramToolOutput,
-} from "../src/telegram/bot.js";
+} from "../src/telegram/message-formatting.js";
 import type { SessionMessage } from "../src/types/domain.js";
 
 const makeTmuxMessage = (text: string): SessionMessage => ({

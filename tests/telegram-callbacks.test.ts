@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  getGroupReadinessAdvice,
   isBuiltInTelegramCommand,
   parseApprovalAction,
   parseApprovalDecision,
   parseToolOutputAction,
   parseTrailingSegment,
-} from "../src/telegram/bot.js";
+} from "../src/telegram/callbacks.js";
+import { getGroupReadinessAdvice } from "../src/telegram/group-readiness.js";
 import type { ApprovalRequest } from "../src/types/domain.js";
 
 describe("telegram callback 解析", () => {
