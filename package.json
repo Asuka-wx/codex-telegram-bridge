@@ -1,0 +1,58 @@
+{
+  "name": "codex-telegram-bridge",
+  "version": "0.1.0",
+  "description": "Bridge local tmux + Codex work sessions to Telegram on macOS.",
+  "license": "MIT",
+  "private": true,
+  "homepage": "https://github.com/Asuka-wx/codex-telegram-bridge",
+  "bugs": {
+    "url": "https://github.com/Asuka-wx/codex-telegram-bridge/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Asuka-wx/codex-telegram-bridge.git"
+  },
+  "type": "module",
+  "os": [
+    "darwin"
+  ],
+  "keywords": [
+    "codex",
+    "telegram",
+    "tmux",
+    "macos"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "setup": "bash ./scripts/install.sh",
+    "setup:uninstall": "bash ./scripts/uninstall.sh",
+    "dev": "tsx src/index.ts",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "telegram:discover": "tsx src/tools/telegram-discover.ts",
+    "launchd:install": "tsx src/tools/install-launch-agent.ts",
+    "launchd:uninstall": "tsx src/tools/uninstall-launch-agent.ts"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "dotenv": "^16.6.1",
+    "grammy": "^1.38.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "@types/node": "^24.6.0",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.36.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.0",
+    "vitest": "^3.2.4"
+  }
+}

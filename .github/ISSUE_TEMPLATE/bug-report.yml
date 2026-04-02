@@ -1,0 +1,62 @@
+name: Bug Report
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先确认：
+        - 你已经阅读 README 和配置说明
+        - 你已经用最新代码复现过问题
+        - 敏感安全问题不要公开提 issue，请改走安全报告渠道
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题概述
+      description: 用 1-3 句话说明问题是什么
+      placeholder: 例如：bridge 启动后能连上 Telegram，但审批卡不会出现在论坛子话题中
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 给出最小可复现步骤
+      placeholder: |
+        1. 执行 ...
+        2. 在 Telegram 里发送 ...
+        3. 观察到 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境信息
+      description: 不要粘贴 token、chat id、user id 等敏感信息
+      placeholder: |
+        - macOS 版本：
+        - Node 版本：
+        - tmux 版本：
+        - Codex CLI 版本：
+        - 安装方式：install.sh / pnpm setup / 手动安装
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志或截图
+      description: 请脱敏后再贴

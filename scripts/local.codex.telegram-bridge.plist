@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!-- 这是模板文件，安装时会由脚本替换为当前机器的实际路径。 -->
+    <key>Label</key>
+    <string>local.codex.telegram-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/zsh</string>
+      <string>__RUN_SCRIPT__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>__WORKING_DIRECTORY__</string>
+
+    <key>StandardOutPath</key>
+    <string>__STDOUT_PATH__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__STDERR_PATH__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>__PATH__</string>
+      <key>HOME</key>
+      <string>__HOME__</string>
+    </dict>
+  </dict>
+</plist>

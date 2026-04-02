@@ -1,0 +1,30 @@
+name: Feature Request
+description: 提出一个功能建议
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你要解决的问题
+      description: 先说问题，再说方案
+      placeholder: 例如：首次安装时需要手动执行太多命令，陌生用户容易卡在 Telegram allowlist 配置这一步
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 说清楚你希望它怎么工作
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过的替代方案
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响与取舍
+      description: 包括维护成本、复杂度、兼容性或安全影响
