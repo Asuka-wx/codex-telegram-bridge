@@ -2,9 +2,27 @@
 
 [中文](README.md) | [English](README.en.md)
 
-Turn local `tmux + Codex` work sessions on macOS into a Telegram control surface.
+Turn local `tmux + Codex` sessions on macOS into a Telegram control surface you can actually use from your phone.
 
-This project is designed for people who already run multiple Codex sessions in local `tmux` windows and want to:
+One-line positioning:
+
+- Keep your existing `ssh + tmux + Codex` workflow, and use Telegram only as the remote layer for status, approvals, and follow-up input.
+
+## Why It Matters
+
+- No workflow rewrite: keep using local `tmux + Codex` instead of switching to a browser dashboard or remote desktop
+- Actually remote-usable: not just logs, but approvals, interrupts, and follow-up input
+- Clear multi-task control: one control topic plus task-specific topics for parallel work
+- Phone-friendly by design: useful when you are away from your machine but still need to keep work moving
+- Lower setup friction: one-command installer plus `launchd` service support
+
+## Who It Is For
+
+- people already running multiple Codex sessions in local `tmux`
+- people who want to handle approvals, status checks, and follow-up input from Telegram
+- people who want a private control surface, not a remote desktop and not a general bot framework
+
+## What You Can Do
 
 - check active windows and recent output
 - continue existing Codex sessions from Telegram
