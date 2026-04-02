@@ -140,27 +140,19 @@
 - 未使用的 `chokidar` 依赖已经移除
 - 后续只需要继续留意是否还有类似“原版遗留但开源版已不用”的包
 
-## P2：公开仓库卫生与增长资产
+## P2：公开仓库卫生与发布资产
 
-### 1. 缺少许可证
+### 1. 许可证与社区文件已补齐
 
-当前仓库没有 `LICENSE` 文件。
-
-这会直接降低外部采用意愿，也会让 GitHub 仓库页缺失许可展示。
-
-### 2. 缺少社区健康文件
-
-当前仓库还缺：
-
-- `CODE_OF_CONDUCT`
-- 仓库级 `SECURITY.md`
+- `LICENSE`
+- `CODE_OF_CONDUCT.md`
+- `SECURITY.md`
 - `.github/ISSUE_TEMPLATE`
-- `PULL_REQUEST_TEMPLATE`
-- `FUNDING.yml`
+- `pull_request_template.md`
 
-这些文件不会影响功能，但会影响 GitHub 的社区资料完整度。
+这部分已经满足公开仓库的基础卫生要求。
 
-### 3. npm 发布尚未准备好
+### 2. npm 发布尚未准备好
 
 当前 `package.json` 仍是：
 
@@ -175,21 +167,20 @@
 - `files`
 - 必要时补 `bin` 或更清晰的安装/运行方式
 
-### 4. 缺少公开传播材料
+### 3. 仍可继续补传播材料
 
 如果目标是“获取名气和经济奖励”，建议后续补：
 
 - 一张总控话题 + 任务子话题的示意图
 - 一段 30-60 秒 GIF 或短视频
 - 一组“为什么不是远程桌面，而是 Telegram 控制面”的定位文案
-- 清晰的 Sponsor / 赞助入口
 
 ## 建议的执行顺序
 
 1. 先恢复 `BridgeService`、`TmuxService` 对结构化事实的联动能力。
 2. 把测试补回关键场景，至少恢复审批链路和 linked session 的核心覆盖。
 3. 再清理剩余示例化私有语境与未使用依赖。
-4. 最后补许可证、社区文件、funding 和发布资产。
+4. 最后补传播素材与仓库展示内容。
 
 ## 发布决策建议
 
@@ -207,7 +198,5 @@
   https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/adding-a-license-to-a-repository
 - GitHub Community Profile：
   https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/about-community-profiles-for-public-repositories
-- GitHub Sponsor Button：
-  https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
 - npm Publish：
   https://docs.npmjs.com/cli/v11/commands/npm-publish/
