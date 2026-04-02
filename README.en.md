@@ -210,7 +210,4 @@ pnpm build
 
 These do not require a real Telegram token or a real local `.env`.
 
-## Remaining Release Decisions
-
-- whether to publish to npm
 - once the repository metadata is stable, fill in `repository`, `homepage`, and `bugs` in `package.json`
