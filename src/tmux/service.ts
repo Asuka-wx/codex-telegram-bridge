@@ -178,7 +178,7 @@ export class TmuxService extends EventEmitter<TmuxEvents> {
 
   async sendControl(
     sessionId: string,
-    key: "Enter" | "y" | "p" | "Escape" | "n" | "C-c",
+    key: ApprovalActionKey,
   ): Promise<boolean> {
     const pane = this.getSession(sessionId);
     if (!pane?.rawPaneId || pane.codexAttached === false) {
@@ -363,16 +363,33 @@ export class TmuxService extends EventEmitter<TmuxEvents> {
       return snapshot;
     }
 
-    const visibleApproval = matchVisibleApproval(
+    const structuredVisibleApproval = matchVisibleApproval(
       snapshot.screenPreview ?? "",
       linkedSession.pendingApprovals ?? [],
     );
+    const screenHasApprovalPrompt = hasVisibleApprovalPrompt(
+      snapshot.screenPreview ?? "",
+    );
+    const paneApprovalFallback =
+      !structuredVisibleApproval &&
+      screenHasApprovalPrompt &&
+      (linkedSession.pendingApprovals?.length ?? 0) === 0 &&
+      !linkedSession.activeApproval
+        ? buildPaneApprovalSnapshot(snapshot, linkedSession)
+        : null;
     const fallbackApproval =
       (linkedSession.pendingApprovals?.length ?? 0) <= 1
         ? linkedSession.activeApproval ?? null
         : null;
+    const visibleApproval = structuredVisibleApproval ?? paneApprovalFallback;
+    const pendingApprovals =
+      (linkedSession.pendingApprovals?.length ?? 0) > 0
+        ? linkedSession.pendingApprovals ?? []
+        : paneApprovalFallback
+          ? [paneApprovalFallback]
+          : [];
     const runtimeState =
-      linkedSession.pendingApprovals?.length
+      linkedSession.pendingApprovals?.length || screenHasApprovalPrompt
         ? "waitingApproval"
         : linkedSession.runtimeState;
 
@@ -383,7 +400,7 @@ export class TmuxService extends EventEmitter<TmuxEvents> {
       preview: extractStructuredPreview(linkedSession) ?? snapshot.preview,
       runtimeState: runtimeState ?? snapshot.runtimeState,
       recentMessages: linkedSession.recentMessages,
-      pendingApprovals: linkedSession.pendingApprovals ?? [],
+      pendingApprovals,
       activeApproval: visibleApproval ?? fallbackApproval,
       visibleApproval,
       latestTurnId: linkedSession.latestTurnId ?? snapshot.latestTurnId,
@@ -657,6 +674,7 @@ export function assignLinkedSessionIds(
 ): Map<string, string | null> {
   const assignedSessionIds = new Set<string>();
   const selected = new Map<string, string | null>();
+  const now = Date.now();
   const assignmentOrder = [...panes].sort((left, right) => {
     if (Boolean(left.preferStableSlot) === Boolean(right.preferStableSlot)) {
       return 0;
@@ -670,8 +688,24 @@ export function assignLinkedSessionIds(
     }
 
     const candidates = sessionsByCwd.get(pane.cwd) ?? [];
+    const previousSession = candidates.find(
+      (session) => session.id === pane.previousLinkedSessionId,
+    );
+    const newerActiveCandidate = candidates.find((session) => {
+      if (session.id === pane.previousLinkedSessionId) {
+        return false;
+      }
+      if (!isSessionAssignmentPreferredCandidate(session, now)) {
+        return false;
+      }
+      if (!previousSession?.updatedAt) {
+        return true;
+      }
+      return (session.updatedAt ?? "") > previousSession.updatedAt;
+    });
     if (
-      candidates.some((session) => session.id === pane.previousLinkedSessionId) &&
+      previousSession &&
+      !newerActiveCandidate &&
       !assignedSessionIds.has(pane.previousLinkedSessionId)
     ) {
       selected.set(pane.paneKey, pane.previousLinkedSessionId);
@@ -703,6 +737,30 @@ export function assignLinkedSessionIds(
 
   return selected;
 }
+
+const isSessionAssignmentPreferredCandidate = (
+  session: SessionSnapshot,
+  now: number,
+): boolean => {
+  if (!session.updatedAt) {
+    return false;
+  }
+
+  if (
+    session.runtimeState !== "active" &&
+    session.runtimeState !== "waitingApproval" &&
+    session.runtimeState !== "waitingUserInput"
+  ) {
+    return false;
+  }
+
+  const updatedAt = Date.parse(session.updatedAt);
+  if (!Number.isFinite(updatedAt)) {
+    return false;
+  }
+
+  return now - updatedAt <= config.codex.sessionActivityWindowSeconds * 1000;
+};
 
 const looksLikeCodexPane = (capture: string): boolean => {
   return (
@@ -834,6 +892,42 @@ function matchVisibleApproval(
   );
 }
 
+const buildPaneApprovalSnapshot = (
+  snapshot: SessionSnapshot,
+  linkedSession?: SessionSnapshot,
+): ApprovalRequest | null => {
+  const capture = snapshot.screenPreview ?? "";
+  const signature = extractApprovalSignature(capture);
+  if (!signature) {
+    return null;
+  }
+
+  const actions = extractApprovalActions(capture);
+  const body = extractApprovalBody(capture);
+  const command = extractApprovalCommand(
+    capture.split("\n").map((line) => line.trim()),
+  );
+  const kind = command ? "command" : "mcpElicitation";
+
+  return {
+    requestId: `${snapshot.id}:${signature}`,
+    sessionId: snapshot.id,
+    linkedSessionId: snapshot.linkedSessionId ?? null,
+    turnId: linkedSession?.latestTurnId ?? snapshot.latestTurnId ?? undefined,
+    kind,
+    title:
+      kind === "mcpElicitation"
+        ? "MCP 工具授权待确认"
+        : "窗口等待确认",
+    body,
+    createdAt: snapshot.updatedAt ?? new Date().toISOString(),
+    rawMethod: "tmux/paneApproval",
+    command: command || undefined,
+    actions,
+    signature,
+  };
+};
+
 const extractTmuxSessionName = (sessionId: string): string | null => {
   if (!sessionId.startsWith("tmux:")) {
     return null;
@@ -870,10 +964,11 @@ export const extractApprovalSignature = (capture: string): string => {
     .map((line) => line.trim())
     .filter(Boolean);
   const title = approvalLines.find((line) => line.startsWith("Would you like to run")) ?? "";
+  const functionLine = extractApprovalFunctionLine(approvalLines);
   const command = extractApprovalCommand(approvalLines);
   const reason = extractApprovalReason(approvalLines);
 
-  return command || title || reason || extractApprovalBody(capture);
+  return command || functionLine || title || reason || extractApprovalBody(capture);
 };
 
 export const hasVisibleApprovalPrompt = (capture: string): boolean => {
@@ -909,7 +1004,7 @@ export const extractApprovalActions = (capture: string): ApprovalAction[] => {
       continue;
     }
 
-    if (line.startsWith("Press enter to confirm") || line.startsWith("$ ")) {
+    if (isApprovalConfirmationHintLine(line) || line.startsWith("$ ")) {
       optionBlocks.push(currentOption);
       currentOption = "";
       continue;
@@ -948,10 +1043,26 @@ export const extractApprovalActions = (capture: string): ApprovalAction[] => {
     return actions;
   }
 
-  if (capture.includes("Press enter to confirm or esc to cancel")) {
+  if (optionBlocks.length > 0 && hasApprovalConfirmationHint(lines)) {
+    return optionBlocks
+      .map((option, index) => {
+        const label = option.replace(/^\d+\.\s+/, "").trim();
+        const key = inferApprovalMenuActionKey(label, index);
+        if (!key) {
+          return null;
+        }
+        return {
+          key,
+          label: renderApprovalMenuActionLabel(key, label),
+        } satisfies ApprovalAction;
+      })
+      .filter((action): action is ApprovalAction => action !== null);
+  }
+
+  if (hasApprovalConfirmationHint(fullLines)) {
     return [
-      { key: "Enter", label: "允许一次" },
-      { key: "Escape", label: "拒绝" },
+      { key: "Enter", label: "允许" },
+      { key: "Escape", label: "取消" },
     ];
   }
 
@@ -989,22 +1100,21 @@ const findActiveApprovalRange = (
     const trimmed = lines[index]?.trim() ?? "";
     if (
       trimmed.startsWith("Would you like to run") ||
-      trimmed.startsWith("Do you want me")
+      trimmed.startsWith("Do you want me") ||
+      isMcpToolApprovalTitleLine(trimmed)
     ) {
       start = index;
       break;
     }
   }
 
-  if (start === -1) {
-    const searchWindow = lines.slice(searchStart, searchEnd + 1);
-    const optionIndexInWindow = searchWindow.findIndex((line) =>
-      isApprovalOptionLikeLine(line),
-    );
-    const hasConfirmationHintInWindow = searchWindow.some((line) =>
-      line.trim().startsWith("Press enter to confirm"),
-    );
+  const searchWindow = lines.slice(searchStart, searchEnd + 1);
+  const optionIndexInWindow = searchWindow.findIndex((line) =>
+    isApprovalOptionLikeLine(line),
+  );
+  const hasConfirmationHintInWindow = hasApprovalConfirmationHint(searchWindow);
 
+  if (start === -1) {
     if (optionIndexInWindow === -1 || !hasConfirmationHintInWindow) {
       return null;
     }
@@ -1026,15 +1136,13 @@ const findActiveApprovalRange = (
 
   const hasCommand = candidate.some((line) => line.startsWith("$ "));
   const hasOption = candidate.some((line) => isApprovalOptionLikeLine(line));
-  const hasConfirmationHint = candidate.some((line) =>
-    line.startsWith("Press enter to confirm"),
-  );
+  const hasConfirmationHint = hasApprovalConfirmationHint(candidate);
   const hasNormalPromptAfterApproval = candidate.some((line) => {
     if (!line.startsWith("› ")) {
       return false;
     }
     const payload = line.slice(2).trim();
-    return !/^\d+\.\s+/.test(payload) && !/^(Yes|No)\b/.test(payload);
+    return !isApprovalOptionLikeLine(payload);
   });
 
   const hasApprovalMenu = hasOption && hasConfirmationHint;
@@ -1110,7 +1218,7 @@ const extractApprovalCommand = (lines: string[]): string => {
     if (
       !line ||
       line.startsWith("Reason:") ||
-      line.startsWith("Press enter to confirm") ||
+      isApprovalConfirmationHintLine(line) ||
       isApprovalOptionLikeLine(line) ||
       line.startsWith("$ ")
     ) {
@@ -1168,6 +1276,77 @@ const normalizeApprovalActionKey = (raw: string): ApprovalActionKey | null => {
   return null;
 };
 
+const isApprovalConfirmationHintLine = (line: string): boolean => {
+  const trimmed = line.trim();
+  return (
+    trimmed.startsWith("Press enter to confirm") ||
+    /^enter to submit\b/i.test(trimmed) ||
+    /^press enter to submit\b/i.test(trimmed)
+  );
+};
+
+const hasApprovalConfirmationHint = (lines: string[]): boolean => {
+  return lines.some((line) => isApprovalConfirmationHintLine(line));
+};
+
+const isMcpToolApprovalTitleLine = (line: string): boolean => {
+  return /^Allow the .+ MCP server to run tool /i.test(line);
+};
+
+const extractApprovalFunctionLine = (lines: string[]): string => {
+  return lines.find((line) => /^function:\s+/i.test(line)) ?? "";
+};
+
+const inferApprovalMenuActionKey = (
+  label: string,
+  index: number,
+): ApprovalActionKey | null => {
+  const normalized = label.trim().toLowerCase();
+  if (
+    normalized === "cancel" ||
+    normalized.startsWith("cancel ") ||
+    normalized.startsWith("reject") ||
+    normalized.startsWith("decline") ||
+    normalized.startsWith("no")
+  ) {
+    return "Escape";
+  }
+
+  if (index === 0) {
+    return "Enter";
+  }
+  if (index === 1) {
+    return "DownEnter";
+  }
+  if (index === 2) {
+    return "DownDownEnter";
+  }
+  if (index === 3) {
+    return "DownDownDownEnter";
+  }
+  return null;
+};
+
+const renderApprovalMenuActionLabel = (
+  key: ApprovalActionKey,
+  fallback: string,
+): string => {
+  const normalized = fallback.trim().toLowerCase();
+  if (normalized === "allow") {
+    return "允许";
+  }
+  if (normalized === "allow for this session") {
+    return "本会话允许";
+  }
+  if (normalized === "always allow") {
+    return "总是允许";
+  }
+  if (normalized === "cancel") {
+    return "取消";
+  }
+  return renderApprovalActionLabel(key, fallback);
+};
+
 const renderApprovalActionLabel = (key: ApprovalActionKey, fallback: string): string => {
   if (key === "y" || key === "Enter") {
     return "允许一次";
@@ -1185,13 +1364,22 @@ const renderApprovalActionLabel = (key: ApprovalActionKey, fallback: string): st
 };
 
 export const buildControlSequence = (
-  key: "Enter" | "y" | "p" | "Escape" | "n" | "C-c",
+  key: ApprovalActionKey,
 ): string[] => {
+  if (key === "DownEnter") {
+    return ["Down", "Enter"];
+  }
+  if (key === "DownDownEnter") {
+    return ["Down", "Down", "Enter"];
+  }
+  if (key === "DownDownDownEnter") {
+    return ["Down", "Down", "Down", "Enter"];
+  }
   return [key];
 };
 
 export const shouldConfirmApprovalShortcut = (
-  key: "Enter" | "y" | "p" | "Escape" | "n" | "C-c",
+  key: ApprovalActionKey,
   beforeApprovalSignature: string,
   afterApprovalSignature: string,
 ): boolean => {

@@ -274,6 +274,41 @@ describe("tmux session 绑定分配", () => {
     expect(result.get("tmux:taskB")).toBe("session-taskb");
     expect(result.get("tmux:approvalProbe")).toBeNull();
   });
+
+  it("旧绑定 session 仍存在但已空闲时，会切到同 cwd 下更新且活跃的新 session", () => {
+    const sessionsByCwd = new Map<string, SessionSnapshot[]>([
+      [
+        "/Users/tester/Dev",
+        [
+          makeSession({
+            id: "session-current",
+            cwd: "/Users/tester/Dev",
+            runtimeState: "active",
+            updatedAt: new Date().toISOString(),
+          }),
+          makeSession({
+            id: "session-previous",
+            cwd: "/Users/tester/Dev",
+            runtimeState: "idle",
+            updatedAt: "2026-04-02T14:14:46.995Z",
+          }),
+        ],
+      ],
+    ]);
+
+    const result = assignLinkedSessionIds(
+      [
+        {
+          paneKey: "tmux:taskB",
+          cwd: "/Users/tester/Dev",
+          previousLinkedSessionId: "session-previous",
+        },
+      ],
+      sessionsByCwd,
+    );
+
+    expect(result.get("tmux:taskB")).toBe("session-current");
+  });
 });
 
 describe("tmux 结构化事实水合", () => {
@@ -420,6 +455,72 @@ describe("tmux 结构化事实水合", () => {
     const sessions = service.refreshSessionFacts("session-structured");
     expect(sessions[0]?.activeApproval?.callId).toBe("call-2");
     expect(sessions[0]?.runtimeState).toBe("waitingApproval");
+  });
+
+  it("linked pane 只有本地 MCP 授权菜单时，也会水合成可投递审批", () => {
+    const indexStub = {
+      getSession: () =>
+        ({
+          id: "session-structured",
+          cwd: "/Users/tester/Dev/project-a",
+          runtimeState: "active",
+          preview: "继续当前任务",
+          recentMessages: [],
+          pendingApprovals: [],
+          activeApproval: null,
+          latestTurnId: "turn-mcp-1",
+        }) satisfies SessionSnapshot,
+    } as unknown as SessionIndex;
+
+    const service = new TmuxService(indexStub) as unknown as {
+      panes: Map<string, SessionSnapshot>;
+      refreshSessionFacts(linkedSessionId?: string): SessionSnapshot[];
+    };
+
+    service.panes = new Map([
+      [
+        "tmux:taskA",
+        {
+          id: "tmux:taskA",
+          linkedSessionId: "session-structured",
+          runtimeState: "idle",
+          preview: "旧的 tmux 预览",
+          recentMessages: [],
+          updatedAt: "2026-04-02T15:08:00.000Z",
+          screenPreview: [
+            "Field 1/1",
+            "Allow the chrome_devtools MCP server to run tool \"evaluate_script\"?",
+            "",
+            "function: () => Array.from(document.querySelectorAll('button'))",
+            "",
+            "› 1. Allow",
+            "2. Allow for this session",
+            "3. Always allow",
+            "4. Cancel",
+            "enter to submit | esc to cancel",
+          ].join("\n"),
+        },
+      ],
+    ]);
+
+    const sessions = service.refreshSessionFacts("session-structured");
+    expect(sessions[0]).toMatchObject({
+      id: "tmux:taskA",
+      runtimeState: "waitingApproval",
+    });
+    expect(sessions[0]?.activeApproval).toMatchObject({
+      rawMethod: "tmux/paneApproval",
+      kind: "mcpElicitation",
+      linkedSessionId: "session-structured",
+      signature:
+        "function: () => Array.from(document.querySelectorAll('button'))",
+    });
+    expect(sessions[0]?.activeApproval?.actions).toEqual([
+      { key: "Enter", label: "允许" },
+      { key: "DownEnter", label: "本会话允许" },
+      { key: "DownDownEnter", label: "总是允许" },
+      { key: "Escape", label: "取消" },
+    ]);
   });
 });
 
@@ -591,10 +692,44 @@ describe("审批动作提取", () => {
     );
   });
 
+  it("会识别 MCP 工具授权菜单，并映射为可远程点击的动作", () => {
+    const capture = [
+      "Field 1/1",
+      "Allow the chrome_devtools MCP server to run tool \"evaluate_script\"?",
+      "",
+      "function: () => Array.from(document.querySelectorAll('button'))",
+      "",
+      "› 1. Allow",
+      "2. Allow for this session",
+      "3. Always allow",
+      "4. Cancel",
+      "enter to submit | esc to cancel",
+      "gpt-5.4 xhigh fast · 97% left · ~/Dev",
+    ].join("\n");
+
+    expect(extractApprovalSignature(capture)).toBe(
+      "function: () => Array.from(document.querySelectorAll('button'))",
+    );
+    expect(extractApprovalActions(capture)).toEqual([
+      { key: "Enter", label: "允许" },
+      { key: "DownEnter", label: "本会话允许" },
+      { key: "DownDownEnter", label: "总是允许" },
+      { key: "Escape", label: "取消" },
+    ]);
+  });
+
   it("审批快捷键默认只发送单键，是否补 Enter 交给运行时判定", () => {
     expect(buildControlSequence("y")).toEqual(["y"]);
     expect(buildControlSequence("p")).toEqual(["p"]);
     expect(buildControlSequence("Escape")).toEqual(["Escape"]);
+    expect(buildControlSequence("DownEnter")).toEqual(["Down", "Enter"]);
+    expect(buildControlSequence("DownDownEnter")).toEqual(["Down", "Down", "Enter"]);
+    expect(buildControlSequence("DownDownDownEnter")).toEqual([
+      "Down",
+      "Down",
+      "Down",
+      "Enter",
+    ]);
   });
 
   it("只有快捷键后仍停留在同一张审批上时，才允许补发 Enter", () => {

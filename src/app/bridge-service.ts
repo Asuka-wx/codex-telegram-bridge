@@ -1,7 +1,11 @@
 import { SessionIndex } from "../codex/session-index.js";
 import { TelegramBotService } from "../telegram/bot.js";
 import { hasVisibleApprovalPrompt, TmuxService } from "../tmux/service.js";
-import type { ApprovalRequest, SessionSnapshot } from "../types/domain.js";
+import type {
+  ApprovalActionKey,
+  ApprovalRequest,
+  SessionSnapshot,
+} from "../types/domain.js";
 import { logger } from "../utils/logger.js";
 import { StateStore } from "./state-store.js";
 
@@ -131,7 +135,7 @@ export class BridgeService {
 
   async sendControl(
     sessionId: string,
-    key: "Enter" | "y" | "p" | "Escape" | "n" | "C-c",
+    key: ApprovalActionKey,
   ): Promise<boolean> {
     const resolved = this.tmux.resolveSessionId(sessionId) ?? sessionId;
     return this.tmux.sendControl(resolved, key);
@@ -419,6 +423,29 @@ export class BridgeService {
       structuredSession?.pendingApprovals?.[0] ??
       null;
     if (!activeApproval) {
+      let deliveredFallback = false;
+      for (const session of sessions) {
+        const paneApproval = session.visibleApproval ?? session.activeApproval ?? null;
+        if (!paneApproval || paneApproval.rawMethod !== "tmux/paneApproval") {
+          continue;
+        }
+
+        logger.info("app", "linked 审批同步发送 Telegram 卡片（tmux 兜底）", {
+          linkedSessionId,
+          targetSessionId: session.id,
+          approvalSignature: paneApproval.signature ?? null,
+        });
+        await this.telegram.sendApprovalRequest({
+          ...paneApproval,
+          sessionId: session.id,
+          linkedSessionId,
+        });
+        deliveredFallback = true;
+      }
+      if (deliveredFallback) {
+        return true;
+      }
+
       logger.info("app", "linked 审批同步跳过：当前没有 activeApproval", {
         linkedSessionId,
         targetSessionIds: sessions.map((session) => session.id),

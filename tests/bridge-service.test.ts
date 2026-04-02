@@ -457,6 +457,91 @@ describe("BridgeService 结构化事件分发", () => {
     expect(bridge.syncStructuredPanelsIfNeeded).toHaveBeenCalledWith(sessions);
   });
 
+  it("linked pane 只有 tmux 本地审批时，也会回退发 TG 卡", async () => {
+    const sessions = [
+      makeSession({
+        id: "tmux:taskA",
+        linkedSessionId: "session-1",
+        runtimeState: "waitingApproval",
+        activeApproval: {
+          requestId: "tmux:taskA:function: evaluate_script",
+          sessionId: "tmux:taskA",
+          linkedSessionId: "session-1",
+          kind: "mcpElicitation",
+          title: "MCP 工具授权待确认",
+          body: "Allow the chrome_devtools MCP server to run tool \"evaluate_script\"?",
+          createdAt: "2026-04-02T15:08:00.000Z",
+          rawMethod: "tmux/paneApproval",
+          signature: "function: evaluate_script",
+          actions: [
+            { key: "Enter", label: "允许" },
+            { key: "DownEnter", label: "本会话允许" },
+            { key: "DownDownEnter", label: "总是允许" },
+            { key: "Escape", label: "取消" },
+          ],
+        },
+        visibleApproval: {
+          requestId: "tmux:taskA:function: evaluate_script",
+          sessionId: "tmux:taskA",
+          linkedSessionId: "session-1",
+          kind: "mcpElicitation",
+          title: "MCP 工具授权待确认",
+          body: "Allow the chrome_devtools MCP server to run tool \"evaluate_script\"?",
+          createdAt: "2026-04-02T15:08:00.000Z",
+          rawMethod: "tmux/paneApproval",
+          signature: "function: evaluate_script",
+          actions: [
+            { key: "Enter", label: "允许" },
+            { key: "DownEnter", label: "本会话允许" },
+            { key: "DownDownEnter", label: "总是允许" },
+            { key: "Escape", label: "取消" },
+          ],
+        },
+        pendingApprovals: [],
+      }),
+    ];
+
+    const bridge = Object.create(BridgeService.prototype) as unknown as BridgeServiceHarness;
+    bridge.approvalResyncTimerByLinkedSessionId = new Map();
+    bridge.topicPanelSignatures = new Map();
+    bridge.sessionIndex = {
+      getSession: vi.fn(() => ({
+        id: "session-1",
+        activeApproval: null,
+        pendingApprovals: [],
+      })),
+    } as never;
+    bridge.tmux = {
+      refreshSessionFacts: vi.fn(() => sessions),
+    } as never;
+    bridge.telegram = {
+      sendApprovalRequest: vi.fn(async () => undefined),
+      clearApprovalTracking: vi.fn(),
+      requestControlPanelSync: vi.fn(),
+      handleApprovalResolution: vi.fn(),
+    } as never;
+    bridge.syncStructuredPanelsIfNeeded = vi.fn(async () => undefined);
+
+    await bridge.handlePaneChanged(
+      makeSession({
+        id: "tmux:taskA",
+        linkedSessionId: "session-1",
+        runtimeState: "waitingApproval",
+      }),
+    );
+
+    expect(bridge.tmux.refreshSessionFacts).toHaveBeenCalledWith("session-1");
+    expect(bridge.telegram.sendApprovalRequest).toHaveBeenCalledTimes(1);
+    expect(bridge.telegram.sendApprovalRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "tmux:taskA",
+        linkedSessionId: "session-1",
+        rawMethod: "tmux/paneApproval",
+        kind: "mcpElicitation",
+      }),
+    );
+  });
+
   it("当前 pane 前台显示的是另一张 pending 时，会优先按前台那张发卡", async () => {
     const sessions = [
       makeSession({

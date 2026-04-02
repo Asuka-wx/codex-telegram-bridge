@@ -39,6 +39,13 @@ describe("telegram callback 解析", () => {
     });
   });
 
+  it("能正确解析新的菜单式审批动作按钮", () => {
+    expect(parseApprovalAction("approvalKey:tmux:taskApproval:DownEnter")).toEqual({
+      sessionId: "tmux:taskApproval",
+      key: "DownEnter",
+    });
+  });
+
   it("能正确解析长输出查看原文按钮", () => {
     expect(parseToolOutputAction("toolOutput:abc123:open")).toEqual({
       requestToken: "abc123",

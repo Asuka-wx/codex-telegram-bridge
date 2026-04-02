@@ -31,7 +31,16 @@ export interface CodexFooterStatus {
   scopeLabel?: string | null;
 }
 
-export type ApprovalActionKey = "Enter" | "y" | "p" | "Escape" | "n" | "C-c";
+export type ApprovalActionKey =
+  | "Enter"
+  | "y"
+  | "p"
+  | "Escape"
+  | "n"
+  | "C-c"
+  | "DownEnter"
+  | "DownDownEnter"
+  | "DownDownDownEnter";
 
 export interface ApprovalAction {
   label: string;

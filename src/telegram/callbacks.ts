@@ -13,6 +13,18 @@ export type TelegramChatIntent =
   | { type: "interrupt" }
   | { type: "key"; key: "Enter" | "y" | "p" | "Escape" | "C-c" };
 
+const APPROVAL_ACTION_KEYS = [
+  "Enter",
+  "y",
+  "p",
+  "Escape",
+  "n",
+  "C-c",
+  "DownEnter",
+  "DownDownEnter",
+  "DownDownDownEnter",
+] as const satisfies ApprovalActionKey[];
+
 const BUILTIN_TELEGRAM_COMMANDS = new Set([
   "start",
   "help",
@@ -68,7 +80,7 @@ export const parseApprovalAction = (
 ): { sessionId: string; key: ApprovalActionKey | "" } => {
   const { sessionId, suffix } = parseTrailingSegment(data, "approvalKey:");
   const key = (
-    ["Enter", "y", "p", "Escape", "n", "C-c"].includes(suffix)
+    APPROVAL_ACTION_KEYS.includes(suffix as ApprovalActionKey)
       ? suffix
       : ""
   ) as ApprovalActionKey | "";
@@ -86,7 +98,7 @@ export const parseApprovalTokenAction = (
     "approvalToken:",
   );
   const key = (
-    ["Enter", "y", "p", "Escape", "n", "C-c"].includes(suffix)
+    APPROVAL_ACTION_KEYS.includes(suffix as ApprovalActionKey)
       ? suffix
       : ""
   ) as ApprovalActionKey | "";
