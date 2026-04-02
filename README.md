@@ -228,8 +228,5 @@ pnpm lint
 pnpm build
 ```
 
-## 已知发布阻塞
-
-下面几项还需要在正式公开前决定：
 
 - 是否要发布到 npm；如果要，`package.json` 还需要补全发布元信息
