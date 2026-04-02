@@ -19,7 +19,7 @@
 
 ### 1. 运行时路径不再写死作者环境
 
-- `scripts/run-bridge.sh` 改成按当前仓库路径推导 `BRIDGE_ROOT` 和默认工作区根目录，并保留现有 `PATH`，不再写死 `HOME=/Users/agent-mac`。
+- `scripts/run-bridge.sh` 改成按当前仓库路径推导 `BRIDGE_ROOT` 和默认工作区根目录，并保留现有 `PATH`，不再写死某台作者机器的 `HOME` 路径。
 - `scripts/bootstrap-tmux.sh` 默认不再自动创建 `taskA/taskB`，并增加了路径回退逻辑。
 - `.env.example` 把 `PROJECT_ROOT`、`TMUX_BOOTSTRAP_*` 改成留空的可选项。
 - LaunchAgent 标签改成中性命名，不再使用作者身份痕迹。

@@ -4,11 +4,15 @@ import { sanitizeLogValue } from "../src/utils/logger.js";
 
 describe("sanitizeLogValue", () => {
   it("会对敏感字段和值做脱敏", () => {
+    const fakeTelegramToken = ["12345678", "abcdefghijklmnopqrstuvwxyz"].join(":");
+    const fakeBearer = ["Bearer", "super-secret-token"].join(" ");
+    const fakeOpenAiKey = ["sk", "abcdefghijklmnopqrstuvwxyz123456"].join("-");
+
     const result = sanitizeLogValue({
-      token: "12345678:abcdefghijklmnopqrstuvwxyz",
+      token: fakeTelegramToken,
       nested: {
-        authorization: "Bearer super-secret-token",
-        note: "OpenAI key sk-abcdefghijklmnopqrstuvwxyz123456",
+        authorization: fakeBearer,
+        note: `OpenAI key ${fakeOpenAiKey}`,
       },
     });
 
@@ -22,8 +26,9 @@ describe("sanitizeLogValue", () => {
   });
 
   it("会把 Error 对象压缩成安全摘要", () => {
+    const fakeTelegramToken = ["12345678", "abcdefghijklmnopqrstuvwxyz"].join(":");
     const result = sanitizeLogValue(
-      new Error("request failed for 12345678:abcdefghijklmnopqrstuvwxyz"),
+      new Error(`request failed for ${fakeTelegramToken}`),
     );
 
     expect(result).toEqual({
